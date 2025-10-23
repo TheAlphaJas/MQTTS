@@ -28,12 +28,4 @@ for file_name, (file_id, target_dir) in files.items():
     shutil.move(temp_path, dest_path)
     print(f"📦 Moved {file_name} → {dest_path}")
 
-# === Download DeepPhonemizer model ===
-print("\n⬇️  Downloading DeepPhonemizer model...")
-subprocess.run([
-    "wget",
-    "https://public-asai-dl-models.s3.eu-central-1.amazonaws.com/DeepPhonemizer/en_us_cmudict_forward.pt",
-    "-P", "ckpt/"
-])
-
 print("\n✅ All files downloaded and organized successfully!")

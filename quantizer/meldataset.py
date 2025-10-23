@@ -108,7 +108,7 @@ class MelDataset(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
-        self.spkr_embedding = Inference("pyannote/embedding", window="whole", use_auth_token="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")
+        self.spkr_embedding = Inference("pyannote/embedding", window="whole")
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
