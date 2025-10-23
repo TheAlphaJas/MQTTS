@@ -22,8 +22,16 @@ except:
     from .utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 
 torch.backends.cudnn.benchmark = True
+os.environ["HF_TOKEN"] = "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"
 
 
+def load_checkpoint(filepath, device):
+    assert os.path.isfile(filepath)
+    print("Loading '{}'".format(filepath))
+    checkpoint_dict = torch.load(filepath, map_location=device)
+    print("Complete.")
+    return checkpoint_dict
+    
 def train(rank, a, h):
     if h.num_gpus > 1:
         init_process_group(backend=h.dist_config['dist_backend'], init_method=h.dist_config['dist_url'],
@@ -37,6 +45,10 @@ def train(rank, a, h):
     quantizer = Quantizer(h).to(device)
     mpd = MultiPeriodDiscriminator().to(device)
     msd = MultiScaleDiscriminator().to(device)
+    state_dict_g = load_checkpoint(a.checkpoint_file, device)
+    encoder.load_state_dict(state_dict_g['encoder'])
+    quantizer.load_state_dict(state_dict_g['quantizer'])
+    generator.load_state_dict(state_dict_g['generator'])
 
     if rank == 0:
         print(encoder)
@@ -266,6 +278,8 @@ def main():
     parser.add_argument('--summary_interval', default=100, type=int)
     parser.add_argument('--validation_interval', default=10000, type=int)
     parser.add_argument('--fine_tuning', default=False, type=bool)
+    parser.add_argument('--checkpoint_file', default="./checkpoints/g_00600000.ckpt")
+    # parser.add_argument('--checkpoint_file', required=True)
 
     a = parser.parse_args()
 

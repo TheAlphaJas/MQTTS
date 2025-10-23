@@ -11,14 +11,14 @@ def download_and_unzip(file_url, output_filename):
         output_filename (str): The name to save the downloaded file as.
     """
     # 1. Download the file using gdown
-    print(f"Downloading {output_filename}...")
-    try:
-        # Using fuzzy=True helps gdown parse various Google Drive link formats
-        gdown.download(file_url, output=output_filename, quiet=False, fuzzy=True)
-        print(f"Successfully downloaded {output_filename}.")
-    except Exception as e:
-        print(f"Failed to download {output_filename}. Error: {e}")
-        return
+    # print(f"Downloading {output_filename}...")
+    # try:
+    #     # Using fuzzy=True helps gdown parse various Google Drive link formats
+    #     gdown.download(file_url, output=output_filename, quiet=False, fuzzy=True, use_cookies=True)
+    #     print(f"Successfully downloaded {output_filename}.")
+    # except Exception as e:
+    #     print(f"Failed to download {output_filename}. Error: {e}")
+    #     return
 
     # 2. Extract the zip file
     if output_filename.endswith('.zip'):
@@ -33,16 +33,41 @@ def download_and_unzip(file_url, output_filename):
             zip_ref.extractall(extract_path)
         print(f"Extraction of {output_filename} complete.")
 
+
+import requests
+
+def download_file_from_google_drive(id, destination):
+    URL = "https://drive.google.com/uc?export=download&confirm=1"
+    
+    session = requests.Session()
+    response = session.get(URL, params={'id': id}, stream=True)
+    
+    # Handle the virus scan warning
+    for key, value in response.cookies.items():
+        if key.startswith('download_warning'):
+            params = {'id': id, 'confirm': value}
+            response = session.get(URL, params=params, stream=True)
+            break
+    
+    # Save file
+    with open(destination, "wb") as f:
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+
+
 if __name__ == '__main__':
     # A list of tuples, where each tuple contains the URL and desired filename
     files_to_process = [
-        ("https://drive.google.com/uc?id=1xCNSj2E7BGIFPgviEU-H6mIpA_wb5IOp", 'titw_easy_metadata.zip'),
-        ("https://drive.google.com/uc?id=1_ezdqBAw6SaeVBF9R-K_63lzlTsUnXux", 'titw_easy_audio.zip')
+        # ("https://drive.google.com/uc?id=1xCNSj2E7BGIFPgviEU-H6mIpA_wb5IOp", 'titw_easy_metadata.zip'),
+        ("https://drive.google.com/uc?id=1_ezdqBAw6SaeVBF9R-K_63lzlTsUnXux", 'titw-easy-audio.zip')
     ]
 
     for url, filename in files_to_process:
         print("-" * 50)
         download_and_unzip(url, filename)
+
+    # download_file_from_google_drive("1_ezdqBAw6SaeVBF9R-K_63lzlTsUnXux", 'titw_easy_audio.zip')
 
     print("\nAll tasks are complete.")
 
