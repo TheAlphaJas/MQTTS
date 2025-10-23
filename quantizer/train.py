@@ -22,7 +22,7 @@ except:
     from .utils import plot_spectrogram, scan_checkpoint, load_checkpoint, save_checkpoint
 
 torch.backends.cudnn.benchmark = True
-os.environ["HF_TOKEN"] = ""
+os.environ["HF_TOKEN"] = "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"
 
 
 def load_checkpoint(filepath, device):
