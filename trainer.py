@@ -10,7 +10,7 @@ from modules.wildttstransformer import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from modules.vocoder import Vocoder
 from torch.utils import data
-import pytorch_lightning.core.lightning as pl
+import pytorch_lightning.core.module as pl
 import soundfile as sf
 import librosa
 import matplotlib.pyplot as plt

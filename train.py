@@ -105,7 +105,6 @@ logger = TensorBoardLogger(args.sampledir, name="VQ-TTS", version=args.version)
 wrapper = Trainer(
     precision=args.precision,
     callbacks=[checkpoint_callback],
-    ckpt_path=args.resume_checkpoint,
     val_check_interval=args.val_check_interval,
     num_sanity_val_steps=0,
     max_steps=args.training_step,
@@ -118,4 +117,5 @@ wrapper = Trainer(
     check_val_every_n_epoch=args.check_val_every_n_epoch
 )
 model = Wav2TTS(args)
-wrapper.fit(model)
+wrapper.fit(model, ckpt_path=args.resume_checkpoint)
+
