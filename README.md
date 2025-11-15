@@ -8,9 +8,10 @@
 ```
 conda create --name mqtts python=3.9
 conda activate mqtts
-conda install pytorch==1.10.1 torchvision==0.11.2 torchaudio==0.10.1 cudatoolkit=11.3 -c pytorch -c conda-forge
+conda install pytorch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 pytorch-cuda=11.8 -c pytorch -c nvidia
 pip install -r requirements.txt
 ```
+Note: For CUDA 11.8, use `pytorch-cuda=11.8`. For CUDA 12.1, use `pytorch-cuda=12.1`. For CPU-only, use `cpuonly` instead of `pytorch-cuda`.
 (Update) You may need to create an access token to use the speaker embedding of pyannote as they updated their policy.
 If that's the case follow the [pyannote repo](https://github.com/pyannote/pyannote-audio) and change every `Inference("pyannote/embedding", window="whole")` accordingly.
 
@@ -79,7 +80,7 @@ python train.py \
      --hidden_size 768 \
      --nheads 12 \
      --batch_size 200 \
-     --precision bf16 \
+     --precision bf16-mixed \
      --training_step 800000 \
      --layer_norm_eps 1e-05
 ```

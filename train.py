@@ -2,7 +2,7 @@ from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
 from trainer import Wav2TTS
-from pytorch_lightning.plugins import DDPPlugin
+from pytorch_lightning.strategies import DDPStrategy
 import argparse
 import json
 import os
@@ -51,10 +51,10 @@ parser.add_argument('--label_smoothing', type=float, default=0.0)
 #Trainer
 parser.add_argument('--val_check_interval', type=int, default=5000)
 parser.add_argument('--check_val_every_n_epoch', type=int, default=1)
-parser.add_argument('--precision', type=str, choices=['16', '32', "bf16"], default=32)
+parser.add_argument('--precision', type=str, choices=['16-mixed', '32-true', "bf16-mixed"], default='32-true')
 parser.add_argument('--nworkers', type=int, default=16)
 parser.add_argument('--distributed', action='store_true')
-parser.add_argument('--accelerator', type=str, default='ddp')
+parser.add_argument('--accelerator', type=str, default='gpu')
 parser.add_argument('--version', type=int, default=None)
 parser.add_argument('--accumulate_grad_batches', type=int, default=1)
 
@@ -86,8 +86,10 @@ with open(os.path.join(args.saving_path, 'config.json'), 'w') as f:
 
 fname_prefix = f''
 
-if args.accelerator == 'ddp':
-    args.accelerator = DDPPlugin(find_unused_parameters=False)
+# Setup strategy for distributed training
+strategy = None
+if args.distributed:
+    strategy = DDPStrategy(find_unused_parameters=False)
 
 checkpoint_callback = ModelCheckpoint(
     dirpath=args.saving_path,
@@ -102,15 +104,15 @@ logger = TensorBoardLogger(args.sampledir, name="VQ-TTS", version=args.version)
 
 wrapper = Trainer(
     precision=args.precision,
-    amp_backend='native',
     callbacks=[checkpoint_callback],
-    resume_from_checkpoint=args.resume_checkpoint,
+    ckpt_path=args.resume_checkpoint,
     val_check_interval=args.val_check_interval,
     num_sanity_val_steps=0,
     max_steps=args.training_step,
-    gpus=(-1 if args.distributed else 1),
-    strategy=(args.accelerator if args.distributed else None),
-    replace_sampler_ddp=False,
+    devices=(-1 if args.distributed else 1),
+    accelerator=args.accelerator,
+    strategy=strategy,
+    use_distributed_sampler=False,
     accumulate_grad_batches=args.accumulate_grad_batches,
     logger=logger,
     check_val_every_n_epoch=args.check_val_every_n_epoch

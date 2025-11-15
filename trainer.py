@@ -48,7 +48,10 @@ class Wav2TTS(pl.LightningModule):
                 module.bias.data.zero_()
         if isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=0.02)
-            module._fill_padding_idx_with_zero()
+            # PyTorch 2.1: Manually zero out padding index if it exists
+            if module.padding_idx is not None:
+                with torch.no_grad():
+                    module.weight.data[module.padding_idx].fill_(0)
         elif isinstance(module, (nn.LayerNorm, nn.GroupNorm)):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
@@ -59,8 +62,16 @@ class Wav2TTS(pl.LightningModule):
 
     def train_dataloader(self):
         length = self.data.lengths
+        # PyTorch Lightning 2.x: world_size and local_rank are still available
+        # Use num_devices * num_nodes for world_size, and global_rank for rank
+        if self.hp.distributed and self.trainer is not None:
+            world_size = getattr(self.trainer, 'world_size', getattr(self.trainer, 'num_devices', 1) * getattr(self.trainer, 'num_nodes', 1))
+            rank = getattr(self.trainer, 'local_rank', getattr(self.trainer, 'global_rank', 0))
+        else:
+            world_size = 1
+            rank = 0
         sampler = RandomBucketSampler(self.hp.train_bucket_size, length, self.hp.batch_size, drop_last=True, distributed=self.hp.distributed,
-                                      world_size=self.trainer.world_size, rank=self.trainer.local_rank)
+                                      world_size=world_size, rank=rank)
         dataset = data.DataLoader(self.data,
                                   num_workers=self.hp.nworkers,
                                   batch_sampler=sampler,

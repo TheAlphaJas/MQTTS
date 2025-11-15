@@ -142,9 +142,9 @@ def train(rank, a, h):
             if rank == 0:
                 start_b = time.time()
             x, y, _, y_mel, spkr = batch
-            x = torch.autograd.Variable(x.to(device, non_blocking=True))
-            y = torch.autograd.Variable(y.to(device, non_blocking=True))
-            y_mel = torch.autograd.Variable(y_mel.to(device, non_blocking=True))
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            y_mel = y_mel.to(device, non_blocking=True)
             y = y.unsqueeze(1)
 
             c = encoder(y)
@@ -229,7 +229,7 @@ def train(rank, a, h):
                             c = encoder(y.to(device).unsqueeze(1))
                             q, loss_q, c = quantizer(c)
                             y_g_hat = generator(q, spkr.to(device))
-                            y_mel = torch.autograd.Variable(y_mel.to(device))
+                            y_mel = y_mel.to(device)
                             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate,
                                                           h.hop_size, h.win_size,
                                                           h.fmin, h.fmax_for_loss)

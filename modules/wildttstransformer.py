@@ -138,7 +138,9 @@ class TTSDecoder(nn.Module):
                 if self.hp.use_repetition_token and self.hp.repetition_penalty != 1.0:
                     logit[:, self.hp.n_codes + 2] /= self.hp.repetition_penalty
                 if self.hp.use_repetition_gating:
-                    logit[:, self.hp.n_codes + 2] = torch.min(torch.max(logit[:, :self.hp.n_codes]), logit[:, self.hp.n_codes + 2])
+                    # PyTorch 2.1: Fix to take max along the last dimension (across codes) for each batch item
+                    max_logit = torch.max(logit[:, :self.hp.n_codes], dim=-1)[0]  # Shape: (N,)
+                    logit[:, self.hp.n_codes + 2] = torch.min(max_logit, logit[:, self.hp.n_codes + 2])
                 #Top_p
                 if self.hp.top_p < 1.0 and self.hp.top_p > 0.0:
                     sorted_logits, sorted_idxs = torch.sort(logit, descending=True)
