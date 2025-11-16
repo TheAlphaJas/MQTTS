@@ -42,6 +42,14 @@ parser.add_argument('--clean_speech_prior', action='store_true')
 parser.add_argument('--prior_noise_level', type=float, default=1e-5)
 parser.add_argument('--prior_frame', type=int, default=3)
 
+#XCodec (loaded from config, but can be overridden)
+parser.add_argument('--use_xcodec', action='store_true', default=None,
+                    help='Use XCodec (if not set, loaded from config)')
+parser.add_argument('--xcodec_model_name', type=str, default=None,
+                    help='XCodec model name (if not set, loaded from config)')
+parser.add_argument('--frame_to_sample_ratio', type=int, default=None,
+                    help='Frame to sample ratio (if not set, loaded from config)')
+
 args = parser.parse_args()
 
 args.phoneset = ['<pad>', 'AA', 'AE', 'AH', 'AO', 'AW', 'AY', 'B', 'CH', 'D', 'DH', 'EH', 'ER', 'EY', 'F', 'G', 'HH', 'IH', 'IY', 'JH', 'K', 'L', 'M', 'N', 'NG', 'OW', 'OY', 'P', 'R', 'S', 'SH', 'T', 'TH', 'UH', 'UW', 'V', 'W', 'Y', 'Z', 'ZH', ',', '.']
@@ -60,8 +68,11 @@ if __name__ == '__main__':
         input_file = json.load(f)
     model = Wav2TTS_infer(args)
     model.cuda()
-    model.vocoder.generator.remove_weight_norm()
-    model.vocoder.encoder.remove_weight_norm()
+    # Remove weight norm only for original vocoder (not needed for xcodec)
+    if hasattr(model.vocoder, 'generator') and model.vocoder.generator is not None:
+        model.vocoder.generator.remove_weight_norm()
+    if hasattr(model.vocoder, 'encoder') and model.vocoder.encoder is not None:
+        model.vocoder.encoder.remove_weight_norm()
     model.eval()
     i_wavs, i_phones, written = [], [], 0
     for i, (speaker_path, sentence) in enumerate(input_file):

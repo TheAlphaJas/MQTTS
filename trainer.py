@@ -31,11 +31,33 @@ class Wav2TTS(pl.LightningModule):
             self.load()
         else:
             self.apply(self.init_weights)
-        self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path)
+        
+        # Initialize vocoder (support both original and xcodec)
+        use_xcodec = getattr(hp, 'use_xcodec', False)
+        if use_xcodec:
+            # XCodec weights are loaded from HuggingFace (pre-trained, not trained locally)
+            # They are frozen by default (same as original vocoder)
+            # To fine-tune XCodec, set fine_tune_xcodec=True in training args
+            fine_tune_xcodec = getattr(hp, 'fine_tune_xcodec', False)
+            self.vocoder = Vocoder(
+                use_xcodec=True,
+                xcodec_model_name=getattr(hp, 'xcodec_model_name', 'facebook/xcodec-base'),
+                n_code_groups=getattr(hp, 'n_cluster_groups', 4),
+                sample_rate=hp.sample_rate
+            )
+            # Set freeze flag for XCodec
+            if hasattr(self.vocoder, 'vocoder_xcodec'):
+                self.vocoder.vocoder_xcodec.xcodec.freeze_encoder = not fine_tune_xcodec
+        else:
+            self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path)
+            if hasattr(self.vocoder, 'generator') and self.vocoder.generator is not None:
+                self.vocoder.generator.remove_weight_norm()
+        
         self.vocoder.eval()
-        self.vocoder.generator.remove_weight_norm()
-        for param in self.vocoder.parameters():
-            param.requires_grad = False
+        # Freeze vocoder parameters (unless fine-tuning XCodec)
+        if not (use_xcodec and getattr(hp, 'fine_tune_xcodec', False)):
+            for param in self.vocoder.parameters():
+                param.requires_grad = False
 
     def load(self):
         state_dict = torch.load(self.hp.pretrained_path)['state_dict']
@@ -152,7 +174,11 @@ class Wav2TTS(pl.LightningModule):
             synthetic = synthetic[0].unsqueeze(0)
             synthetic = self.vocoder(synthetic, norm_spkr).float()
             #Reconstructed Audio with vocoder
-            reconstructed_gt = self.vocoder(q_s[:, 1:], norm_spkr).float()
+            # q_s has shape (1, T, n_code_groups), skip first token (start token)
+            if q_s.size(1) > 1:
+                reconstructed_gt = self.vocoder(q_s[:, 1:], norm_spkr).float()
+            else:
+                reconstructed_gt = torch.zeros_like(ground_truth[0])
             #Write files
             sw = self.logger.experiment
             sw.add_audio(f'generated/{batch_idx}', synthetic, self.global_step, self.hp.sample_rate)

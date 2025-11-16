@@ -78,6 +78,16 @@ parser.add_argument('--sample_rate', type=int, default=16000)
 parser.add_argument('--n_codes', type=int, default=160)
 parser.add_argument('--n_cluster_groups', type=int, default=4)
 
+#XCodec integration
+parser.add_argument('--use_xcodec', action='store_true',
+                    help='Use XCodec instead of original quantizer. XCodec weights are loaded from HuggingFace (pre-trained, not trained locally).')
+parser.add_argument('--xcodec_model_name', type=str, default='facebook/xcodec-base',
+                    help='HuggingFace model name for XCodec (weights loaded from here)')
+parser.add_argument('--fine_tune_xcodec', action='store_true',
+                    help='Fine-tune XCodec during training (default: frozen, like original vocoder)')
+parser.add_argument('--frame_to_sample_ratio', type=int, default=256,
+                    help='Frame to sample ratio for vocoder (may differ for XCodec)')
+
 
 args = parser.parse_args()
 

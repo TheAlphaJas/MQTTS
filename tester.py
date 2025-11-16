@@ -23,7 +23,22 @@ class Wav2TTS_infer(nn.Module):
         self.phone_embedding = nn.Embedding(len(self.hp.phoneset), hp.hidden_size, padding_idx=self.hp.phoneset.index('<pad>'))
         self.load()
         self.spkr_embedding = Inference("pyannote/embedding", window="whole")
-        self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path, with_encoder=True)
+        
+        # Support both original and xcodec vocoders
+        use_xcodec = getattr(hp, 'use_xcodec', False)
+        if use_xcodec:
+            self.vocoder = Vocoder(
+                use_xcodec=True,
+                xcodec_model_name=getattr(hp, 'xcodec_model_name', 'facebook/xcodec-base'),
+                n_code_groups=getattr(hp, 'n_cluster_groups', 4),
+                sample_rate=hp.sample_rate
+            )
+        else:
+            self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path, with_encoder=True)
+            if hasattr(self.vocoder, 'generator') and self.vocoder.generator is not None:
+                self.vocoder.generator.remove_weight_norm()
+            if hasattr(self.vocoder, 'encoder') and self.vocoder.encoder is not None:
+                self.vocoder.encoder.remove_weight_norm()
 
     def load(self):
         state_dict = torch.load(self.hp.model_path)['state_dict']
@@ -46,7 +61,8 @@ class Wav2TTS_infer(nn.Module):
             norm_spkr = F.normalize(speaker_embeddings, dim=-1)
             speaker_embedding = self.spkr_linear(norm_spkr)
             low_background_noise = torch.randn(batch_size, int(self.hp.sample_rate * 5.0)) * self.hp.prior_noise_level
-            base_prior = self.vocoder.encode(low_background_noise.cuda())
+            low_background_noise = low_background_noise.cuda()
+            base_prior = self.vocoder.encode(low_background_noise)
             if self.hp.clean_speech_prior:
                 prior = base_prior[:, :self.hp.prior_frame]
             else:
@@ -73,7 +89,10 @@ class Wav2TTS_infer(nn.Module):
             maxlen = max([len(x) for x in synthetic])
             for i, s in enumerate(synthetic):
                 to_pad = maxlen - len(s)
-                lengths.append(len(s) * 256) # Have to change according to vocoder stride!
+                # Frame-to-sample ratio depends on vocoder
+                # For XCodec, this may be different - adjust based on actual frame rate
+                frame_to_sample = getattr(self.hp, 'frame_to_sample_ratio', 256)
+                lengths.append(len(s) * frame_to_sample)
                 pad = base_prior[i, base_prior.size(1)//2].unsqueeze(0).expand(to_pad, -1)
                 if self.hp.clean_speech_prior:
                     s = torch.cat([prior[i, :], s, pad], 0)
