@@ -49,8 +49,9 @@ parser.add_argument('--speaker_embed_dropout', type=float, default=0.0)
 parser.add_argument('--label_smoothing', type=float, default=0.0)
 
 #Trainer
-parser.add_argument('--val_check_interval', type=int, default=5000)
+parser.add_argument('--val_check_interval', type=float, default=5000.0)
 parser.add_argument('--check_val_every_n_epoch', type=int, default=1)
+parser.add_argument('--max_epochs', type=int, default=None)
 parser.add_argument('--precision', type=str, choices=['16-mixed', '32-true', "bf16-mixed"], default='32-true')
 parser.add_argument('--nworkers', type=int, default=16)
 parser.add_argument('--distributed', action='store_true')
@@ -82,7 +83,8 @@ parser.add_argument('--n_cluster_groups', type=int, default=4)
 parser.add_argument('--style_encoder_type', type=str, choices=['style_tts2'], default=None)
 parser.add_argument('--style_encoder_ckpt', type=str, default=None)
 parser.add_argument('--fine_tune_vocoder', action='store_true')
-
+parser.add_argument('--verbose_step', type=int, default=1000)
+parser.add_argument('--verbose_file', type=str, default='verbose.txt')
 
 args = parser.parse_args()
 
@@ -99,7 +101,7 @@ if args.distributed:
 checkpoint_callback = ModelCheckpoint(
     dirpath=args.saving_path,
     filename=(fname_prefix+'{epoch}-{step}'),
-    every_n_train_steps=(None if args.val_check_interval == 1.0 else args.val_check_interval),
+    every_n_train_steps=(None if args.val_check_interval == 1.0 else (int(args.val_check_interval) if args.val_check_interval > 1.0 else None)),
     every_n_epochs=(None if args.check_val_every_n_epoch == 1 else args.check_val_every_n_epoch),
     verbose=True,
     save_last=True
@@ -107,12 +109,17 @@ checkpoint_callback = ModelCheckpoint(
 
 logger = TensorBoardLogger(args.sampledir, name="VQ-TTS", version=args.version)
 
+val_interval = args.val_check_interval
+if val_interval > 1.0:
+    val_interval = int(val_interval)
+
 wrapper = Trainer(
     precision=args.precision,
     callbacks=[checkpoint_callback],
-    val_check_interval=args.val_check_interval,
+    val_check_interval=val_interval,
     num_sanity_val_steps=0,
-    max_steps=args.training_step,
+    max_steps=-1 if args.max_epochs is not None else args.training_step,
+    max_epochs=args.max_epochs,
     devices=(-1 if args.distributed else 1),
     accelerator=args.accelerator,
     strategy=strategy,

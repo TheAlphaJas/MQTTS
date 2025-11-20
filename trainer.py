@@ -72,6 +72,17 @@ class Wav2TTS(pl.LightningModule):
         else:
             self.apply(self.init_weights)
         
+        # Re-load style encoder if it was overwritten by pretrained_path (unlikely if strict=False and keys don't match, but safe to check)
+        # Actually, load() calls load_state_dict(..., strict=False).
+        # If pretrained_path is MQTTS, it won't have style_encoder keys, so style_encoder remains as initialized above.
+        # If pretrained_path IS a new checkpoint that HAS style_encoder, it will overwrite what we loaded above.
+        # This is generally desired behavior (resume training).
+        # But user wants: 1. StyleTTS2 ckpt for StyleEncoder, 2. MQTTS ckpt for the rest.
+        # So we are good: 
+        #   Step 1: Initialize StyleEncoder and load StyleTTS2 weights.
+        #   Step 2: Load MQTTS weights (which doesn't have StyleEncoder keys) into the rest of the model.
+        #   Result: Mixed model. 
+        
         self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path)
         
         if hasattr(hp, 'fine_tune_vocoder') and hp.fine_tune_vocoder:
@@ -179,6 +190,14 @@ class Wav2TTS(pl.LightningModule):
         self.log("train/loss", loss, on_step=True, prog_bar=True)
         self.log("train/acc", acc, on_step=True, prog_bar=True)
         
+        # Verbose logging
+        if self.global_step % self.hp.verbose_step == 0 and self.global_step > 0:
+             msg = f"Epoch: {self.current_epoch} | Step: {self.global_step} | Loss: {loss.item():.4f} | Acc: {acc.item():.4f}"
+             print(msg)
+             if hasattr(self.hp, 'verbose_file') and self.hp.verbose_file:
+                 with open(self.hp.verbose_file, 'a') as f:
+                     f.write(f"{msg}\n")
+
         if hasattr(self.hp, 'fine_tune_vocoder') and self.hp.fine_tune_vocoder:
             # Vocoder Fine-tuning logic
             # Use GT codes: batch['tts_quantize_input'] (or output?)
