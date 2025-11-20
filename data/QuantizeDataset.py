@@ -65,6 +65,9 @@ class QuantizeDataset(data.Dataset):
         else:
             speaker_embedding = os.path.join(self.hp.speaker_embedding_dir, os.path.splitext(_name)[0] + '.npy')
             speaker_embedding = np.load(speaker_embedding).astype(np.float32)
+            # Load audio even if embedding is present, for style encoder
+            audio, sampling_rate = sf.read(dataname)
+            audio = normalize(audio) * 0.95
 
         #Ground truth for TTS system
         quantization = np.array(metadata['quantization']).T # ..., 4
@@ -77,7 +80,7 @@ class QuantizeDataset(data.Dataset):
             np_mask = np.diff(quantization, axis=0, prepend=pad)
             quantization[np_mask == 0] = self.hp.n_codes + 2
         quantization_e = np.concatenate([quantization, end], 0)
-        return speaker_embedding, quantization_s, quantization_e, phonemes, dataname
+        return speaker_embedding, quantization_s, quantization_e, phonemes, dataname, audio
 
     def seqCollate(self, batch):
         output = {
@@ -87,17 +90,20 @@ class QuantizeDataset(data.Dataset):
             'tts_quantize_input': [],
             'tts_quantize_output': [],
             'quantize_mask': [],
+            'audio': []
         }
         #Get the max length of everything
-        max_len_q, max_phonelen = 0, 0
-        for spkr, q_s, q_e, ph, _ in batch:
+        max_len_q, max_phonelen, max_audiolen = 0, 0, 0
+        for spkr, q_s, q_e, ph, _, aud in batch:
             if len(q_s) > max_len_q:
                 max_len_q = len(q_s)
             if len(ph) > max_phonelen:
                 max_phonelen = len(ph)
+            if len(aud) > max_audiolen:
+                max_audiolen = len(aud)
             output['speaker'].append(spkr)
         #Pad each element, create mask
-        for _, qs, qe, phone, _ in batch:
+        for _, qs, qe, phone, _, aud in batch:
             #Deal with phonemes
             phone_mask = np.array([False] * len(phone) + [True] * (max_phonelen - len(phone)))
             phone = np.pad(phone, [0, max_phonelen-len(phone)])
@@ -105,12 +111,16 @@ class QuantizeDataset(data.Dataset):
             q_mask = np.array([False] * len(qs) + [True] * (max_len_q - len(qs)))
             qs = np.pad(qs, [[0, max_len_q-len(qs)], [0, 0]], constant_values=self.hp.n_codes)
             qe = np.pad(qe, [[0, max_len_q-len(qe)], [0, 0]], constant_values=self.hp.n_codes)
+            #Deal with audio
+            aud = np.pad(aud, [0, max_audiolen-len(aud)])
+            
             #Aggregate
             output['phone'].append(phone)
             output['phone_mask'].append(phone_mask)
             output['tts_quantize_input'].append(qs)
             output['tts_quantize_output'].append(qe)
             output['quantize_mask'].append(q_mask)
+            output['audio'].append(aud)
         for k in output.keys():
             output[k] = np.array(output[k])
             if 'mask' in k:
@@ -126,9 +136,7 @@ class QuantizeDatasetVal(QuantizeDataset):
         return len(self.dataset)
 
     def __getitem__(self, i):
-        speaker_embedding, quantization_s, quantization_e, phonemes, dataname = super().__getitem__(i)
-        audio, sampling_rate = sf.read(dataname)
-        audio = normalize(audio) * 0.95
+        speaker_embedding, quantization_s, quantization_e, phonemes, dataname, audio = super().__getitem__(i)
         return (
             torch.FloatTensor(speaker_embedding),
             torch.LongTensor(quantization_s),

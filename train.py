@@ -78,6 +78,11 @@ parser.add_argument('--sample_rate', type=int, default=16000)
 parser.add_argument('--n_codes', type=int, default=160)
 parser.add_argument('--n_cluster_groups', type=int, default=4)
 
+#Style Encoder & Vocoder Fine-tuning
+parser.add_argument('--style_encoder_type', type=str, choices=['style_tts2'], default=None)
+parser.add_argument('--style_encoder_ckpt', type=str, default=None)
+parser.add_argument('--fine_tune_vocoder', action='store_true')
+
 
 args = parser.parse_args()
 

@@ -9,6 +9,8 @@ from data.sampler import RandomBucketSampler
 from modules.wildttstransformer import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from modules.vocoder import Vocoder
+from modules.style_encoder import StyleEncoder
+from quantizer.meldataset import mel_spectrogram
 from torch.utils import data
 import pytorch_lightning.core.module as pl
 import soundfile as sf
@@ -27,15 +29,66 @@ class Wav2TTS(pl.LightningModule):
         self.cross_entropy = nn.CrossEntropyLoss(label_smoothing=self.hp.label_smoothing)
         self.phone_embedding = nn.Embedding(len(self.data.phoneset), hp.hidden_size, padding_idx=self.data.phoneset.index('<pad>'))
         self.spkr_linear = nn.Linear(512, hp.hidden_size)
+        
+        # Style Encoder
+        self.style_encoder = None
+        if hasattr(hp, 'style_encoder_type') and hp.style_encoder_type == 'style_tts2':
+            self.style_encoder = StyleEncoder()
+            
+            if self.style_encoder and hasattr(hp, 'style_encoder_ckpt') and hp.style_encoder_ckpt:
+                print(f"Loading style encoder weights from {hp.style_encoder_ckpt}")
+                ckpt = torch.load(hp.style_encoder_ckpt, map_location='cpu')
+                # Handle state dict keys
+                # Check if ckpt is full model or just encoder
+                if 'model_state_dict' in ckpt:
+                     # StyleTTS2 generic checkpoint
+                     state_dict = ckpt['model_state_dict']
+                elif 'model' in ckpt:
+                     # Sometimes saved as model
+                     state_dict = ckpt['model']
+                else:
+                     state_dict = ckpt
+                
+                # Filter keys for style_encoder
+                # StyleTTS2 keys usually start with 'style_encoder.'
+                new_state_dict = {}
+                for k, v in state_dict.items():
+                    if k.startswith('style_encoder.'):
+                        new_state_dict[k.replace('style_encoder.', '')] = v
+                    elif k.startswith('style_enc.'): # Potential variation
+                        new_state_dict[k.replace('style_enc.', '')] = v
+                
+                if len(new_state_dict) > 0:
+                    print(f"Found {len(new_state_dict)} keys for style encoder.")
+                    missing, unexpected = self.style_encoder.load_state_dict(new_state_dict, strict=False)
+                    print(f"Missing keys: {missing}")
+                    print(f"Unexpected keys: {unexpected}")
+                else:
+                    print("No style encoder keys found in checkpoint. Initializing randomly.")
+
+
         if self.hp.pretrained_path:
             self.load()
         else:
             self.apply(self.init_weights)
+        
         self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path)
-        self.vocoder.eval()
-        self.vocoder.generator.remove_weight_norm()
-        for param in self.vocoder.parameters():
-            param.requires_grad = False
+        
+        if hasattr(hp, 'fine_tune_vocoder') and hp.fine_tune_vocoder:
+            print("Fine-tuning vocoder enabled.")
+            self.vocoder.train()
+            # We do NOT remove weight norm if we are training, usually.
+            # But if the loaded checkpoint had weight norm removed, we might need to add it back or just train without it.
+            # Given we load a pre-trained vocoder, it likely has weight norm (unless it was saved after removal).
+            # Modules like Conv1d default don't have weight norm unless applied.
+            # The Generator class uses weight_norm wrapper.
+            # If we load state_dict, we need to match structure.
+            # Assuming we just leave it as is for fine-tuning.
+        else:
+            self.vocoder.eval()
+            self.vocoder.generator.remove_weight_norm()
+            for param in self.vocoder.parameters():
+                param.requires_grad = False
 
     def load(self):
         state_dict = torch.load(self.hp.pretrained_path)['state_dict']
@@ -106,12 +159,18 @@ class Wav2TTS(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         #Deal with speaker embedding
-        speaker_embedding = F.normalize(batch['speaker'], dim=-1)
-        speaker_embedding = self.spkr_linear(F.dropout(speaker_embedding, self.hp.speaker_embed_dropout))
+        if self.style_encoder:
+             style_embedding = self.style_encoder(batch['audio'])
+             speaker_embedding = F.normalize(style_embedding, dim=-1)
+        else:
+             speaker_embedding = F.normalize(batch['speaker'], dim=-1)
+        
+        speaker_embedding_proj = self.spkr_linear(F.dropout(speaker_embedding, self.hp.speaker_embed_dropout))
+        
         #Deal with phone segments
         phone_features = self.phone_embedding(batch['phone'])
         #Run decoder
-        recons_segments = self.TTSdecoder(batch['tts_quantize_input'], phone_features, speaker_embedding,
+        recons_segments = self.TTSdecoder(batch['tts_quantize_input'], phone_features, speaker_embedding_proj,
                                           batch['quantize_mask'], batch['phone_mask'])
         target = recons_segments['logits'][~batch['quantize_mask']].view(-1, self.n_decode_codes)
         labels = batch['tts_quantize_output'][~batch['quantize_mask']].view(-1)
@@ -119,6 +178,43 @@ class Wav2TTS(pl.LightningModule):
         acc = (target.argmax(-1) == labels).float().mean()
         self.log("train/loss", loss, on_step=True, prog_bar=True)
         self.log("train/acc", acc, on_step=True, prog_bar=True)
+        
+        if hasattr(self.hp, 'fine_tune_vocoder') and self.hp.fine_tune_vocoder:
+            # Vocoder Fine-tuning logic
+            # Use GT codes: batch['tts_quantize_input'] (or output?)
+            # tts_quantize_input has Start Token?
+            # Let's use batch['tts_quantize_input'] excluding start token for better alignment?
+            # The vocoder typically trained on codes without start token if they represent audio frames.
+            # batch['tts_quantize_input'] is padded.
+            
+            # In validation_step, it uses: self.vocoder(q_s[:, 1:], norm_spkr)
+            # q_s is batch['tts_quantize_input'] (from QuantizeDataset).
+            # So we should use batch['tts_quantize_input'][:, 1:]
+            
+            voc_input = batch['tts_quantize_input'][:, 1:]
+            
+            # Generate audio
+            audio_hat = self.vocoder(voc_input, speaker_embedding) # Pass normalized style embedding
+            
+            # Get GT audio
+            audio_gt = batch['audio'].unsqueeze(1) # N, 1, T
+            
+            # Match lengths
+            min_len = min(audio_gt.shape[-1], audio_hat.shape[-1])
+            audio_gt = audio_gt[..., :min_len]
+            audio_hat = audio_hat[..., :min_len]
+            
+            # Compute Mel Loss
+            # Need self.vocoder.h params
+            h = self.vocoder.h
+            mel_gt = mel_spectrogram(audio_gt.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
+            mel_hat = mel_spectrogram(audio_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
+            
+            loss_voc = F.l1_loss(mel_hat, mel_gt)
+            self.log("train/loss_voc", loss_voc, on_step=True, prog_bar=True)
+            
+            loss = loss + loss_voc
+            
         return loss
 
     def on_validation_epoch_start(self):
@@ -133,10 +229,28 @@ class Wav2TTS(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         #Batch size = 1
         spkr, q_s, q_e, phone, ground_truth = batch
-        norm_spkr = F.normalize(spkr, dim=-1)
-        spkr = self.spkr_linear(norm_spkr)
+        
+        # We need audio for style encoder in validation too, but validation_step signature in dataset returns it as ground_truth (5th element)
+        # QuantizeDatasetVal returns: (spkr, q_s, q_e, ph, audio)
+        # But wait, my modification to QuantizeDatasetVal.getitem returned:
+        # (speaker_embedding, quantization_s, quantization_e, phonemes, audio)
+        # So batch unpacking:
+        # spkr, q_s, q_e, phone, ground_truth = batch
+        # This matches.
+        
+        if self.style_encoder:
+             # ground_truth is the audio (N, T)
+             # We need to pass it to style_encoder.
+             # But ground_truth in validation might be just waveform.
+             # style_encoder expects (B, T)
+             style_embedding = self.style_encoder(ground_truth)
+             norm_spkr = F.normalize(style_embedding, dim=-1)
+        else:
+             norm_spkr = F.normalize(spkr, dim=-1)
+             
+        spkr_proj = self.spkr_linear(norm_spkr)
         phone_features = self.phone_embedding(phone)
-        recons_segments = self.TTSdecoder(q_s, phone_features, spkr, None, None)
+        recons_segments = self.TTSdecoder(q_s, phone_features, spkr_proj, None, None)
         target = recons_segments['logits'].view(-1, self.n_decode_codes)
         labels = q_e.view(-1)
         loss = self.cross_entropy(target, labels)
@@ -148,7 +262,7 @@ class Wav2TTS(pl.LightningModule):
         if batch_idx in self.sample_idxs:
             batch_idx = self.sample_idxs.index(batch_idx)
             phone_mask = torch.full((phone_features.size(0), phone_features.size(1)), False, dtype=torch.bool, device=phone_features.device)
-            synthetic, infer_attn = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, spkr, phone_mask, prior=None, output_alignment=True)
+            synthetic, infer_attn = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, spkr_proj, phone_mask, prior=None, output_alignment=True)
             synthetic = synthetic[0].unsqueeze(0)
             synthetic = self.vocoder(synthetic, norm_spkr).float()
             #Reconstructed Audio with vocoder
