@@ -23,23 +23,58 @@ class TTSDecoder(nn.Module):
         self.aligner = CrossAttnOnlyLayer(hp)
         self.layer_norm_phone = nn.LayerNorm(hp.hidden_size, eps=hp.layer_norm_eps)
         self.layer_norm_spkr = nn.LayerNorm(hp.hidden_size, eps=hp.layer_norm_eps)
+        
+        # Semantic Projection Layer (384 -> hidden_size)
+        self.semantic_linear = nn.Linear(384, hp.hidden_size)
+        self.layer_norm_semantic = nn.LayerNorm(hp.hidden_size, eps=hp.layer_norm_eps)
+        
         self.transducer = Transducer(hp)
         self.alibi = AlibiPostionEmbedding(hp.nheads, 10000)
         self.layer_norm = nn.LayerNorm(hp.hidden_size, eps=hp.layer_norm_eps)
         self.tgt_mask = (torch.tril(torch.ones(10000, 10000), diagonal=0) == 0)
 
-    def forward(self, q, phone, spkr, q_mask, phone_mask):
-        #Fused phone + speaker
-        ex_phone_mask = torch.cat([torch.zeros((spkr.size(0), 1), device=spkr.device, dtype=torch.bool),
+    def forward(self, q, phone, spkr, semantic, q_mask, phone_mask):
+        #Fused phone + speaker + semantic
+        # spkr: (B, Hidden), semantic: (B, 384)
+        
+        # Expand masks for the extra token (semantic)
+        # Original: spkr (1 token) + phone (N tokens)
+        # New: spkr (1) + semantic (1) + phone (N)
+        
+        # phone_mask is (B, T_phone)
+        # We add 2 False values (unmasked) to the left for spkr and semantic
+        ex_phone_mask = torch.cat([torch.zeros((spkr.size(0), 2), device=spkr.device, dtype=torch.bool),
                                    phone_mask], 1) if phone_mask is not None else None
-        spkr = self.layer_norm_spkr(spkr.unsqueeze(1))
+                                   
+        spkr = self.layer_norm_spkr(spkr.unsqueeze(1)) # B, 1, H
+        
+        semantic = self.semantic_linear(semantic) # B, H
+        semantic = self.layer_norm_semantic(semantic.unsqueeze(1)) # B, 1, H
+        
         phone = self.layer_norm_phone(phone)
-        phone = torch.cat([spkr, phone], 1)
+        
+        # Cat: [Spkr, Semantic, Phone...]
+        phone = torch.cat([spkr, semantic, phone], 1)
+        
         phone_alibi = self.alibi(phone)
-        phone_alibi[:, 0] = 0
-        phone_alibi[:, :, 0] = 0
+        # Zero out ALiBi for Spkr (0) and Semantic (1)? 
+        # Original code zeroed out 0th index. Now we likely want to zero out 0 and 1.
+        # Or maybe they should just have relative positions? 
+        # Original: phone_alibi[:, 0] = 0; phone_alibi[:, :, 0] = 0
+        # This effectively removes bias for attending FROM token 0 and TO token 0.
+        # Let's extend this to the first 2 tokens.
+        phone_alibi[:, :2] = 0
+        phone_alibi[:, :, :2] = 0
+        
         phone, enc_attn = self.encoder(phone, mask=None, attn_bias=phone_alibi, src_key_padding_mask=ex_phone_mask)
-        phone = phone[:, 1:]
+        
+        # Strip Spkr and Semantic from output for Aligner?
+        # Original: phone = phone[:, 1:] (Removes Spkr)
+        # Now we have 2 prefix tokens.
+        # The Aligner aligns Audio to Phonemes. It likely doesn't need to align to Spkr/Semantic directly 
+        # (global context is fused into phoneme embeddings via self-attention).
+        phone = phone[:, 2:] 
+        
         #Run decoder
         q_mask = torch.cat([torch.zeros((spkr.size(0), 1), device=spkr.device, dtype=torch.bool),
                             q_mask], 1) if q_mask is not None else None
@@ -68,31 +103,43 @@ class TTSDecoder(nn.Module):
             'encoder_attention': enc_attn
         }
 
-    def encode_phone(self, phone, spkr, phone_mask):
+    def encode_phone(self, phone, spkr, semantic, phone_mask):
+        spkr = self.layer_norm_spkr(spkr.unsqueeze(1))
+        
+        semantic = self.semantic_linear(semantic)
+        semantic = self.layer_norm_semantic(semantic.unsqueeze(1))
+        
         phone = self.layer_norm_phone(phone)
-        phone = torch.cat([spkr, phone], 1)
-        ex_phone_mask = torch.cat([torch.zeros((spkr.size(0), 1), device=spkr.device, dtype=torch.bool), phone_mask], 1)
+        
+        phone = torch.cat([spkr, semantic, phone], 1)
+        
+        ex_phone_mask = torch.cat([torch.zeros((spkr.size(0), 2), device=spkr.device, dtype=torch.bool), phone_mask], 1)
         phone_alibi = self.alibi(phone)
-        phone_alibi[:, 0] = 0
-        phone_alibi[:, :, 0] = 0
+        phone_alibi[:, :2] = 0
+        phone_alibi[:, :, :2] = 0
         phone, enc_attn = self.encoder(phone, mask=None, attn_bias=phone_alibi, src_key_padding_mask=ex_phone_mask)
-        phone = phone[:, 1:]
+        phone = phone[:, 2:]
         return phone
 
-    def inference_topkp_sampling_batch(self, phone, spkr, phone_mask, prior=None, output_alignment=False):
+    def inference_topkp_sampling_batch(self, phone, spkr, semantic, phone_mask, prior=None, output_alignment=False):
         batch_size = phone.size(0)
         final_outputs = [0 for _ in range(batch_size)]
-        spkr = self.layer_norm_spkr(spkr.unsqueeze(1))
+        # We keep spkr for decoding audio start
+        spkr_emb = self.layer_norm_spkr(spkr.unsqueeze(1))
+        
         inp = self.layer_norm(self.transducer.start_token(phone.device)) #1, 1, C
         inp = inp.expand(batch_size, -1, -1) #N, 1, C
-        inp = torch.cat([spkr, inp], 1)
+        inp = torch.cat([spkr_emb, inp], 1)
         prior_size = 0
         if prior is not None:
             prior = self.transducer.encode(prior)
             prior = self.layer_norm(prior)
             prior_size = prior.size(1)
             inp = torch.cat([inp, prior], 1)
-        phone = self.encode_phone(phone, spkr, phone_mask)
+        
+        # Pass semantic to encoder
+        phone = self.encode_phone(phone, spkr, semantic, phone_mask)
+        
         tgt_mask = self.tgt_mask[:inp.size(1), :inp.size(1)].to(inp.device)
         inps = inp
         #Decode

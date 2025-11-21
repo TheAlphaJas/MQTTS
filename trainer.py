@@ -10,6 +10,7 @@ from modules.wildttstransformer import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from modules.vocoder import Vocoder
 from modules.style_encoder import StyleEncoder
+from modules.text_encoder import SemanticEncoder
 from quantizer.meldataset import mel_spectrogram
 from torch.utils import data
 import pytorch_lightning.core.module as pl
@@ -28,13 +29,28 @@ class Wav2TTS(pl.LightningModule):
         self.n_decode_codes = self.TTSdecoder.transducer.n_decoder_codes
         self.cross_entropy = nn.CrossEntropyLoss(label_smoothing=self.hp.label_smoothing)
         self.phone_embedding = nn.Embedding(len(self.data.phoneset), hp.hidden_size, padding_idx=self.data.phoneset.index('<pad>'))
-        self.spkr_linear = nn.Linear(512, hp.hidden_size)
+        
+        # Initialize spkr_linear with correct input dimension
+        spkr_embed_dim = 512
+        
+        # Semantic Encoder (SBERT)
+        self.semantic_encoder = SemanticEncoder(device='cuda') # Will be moved to correct device by Lightning
         
         # Style Encoder
         self.style_encoder = None
         if hasattr(hp, 'style_encoder_type') and hp.style_encoder_type == 'style_tts2':
             self.style_encoder = StyleEncoder()
+            spkr_embed_dim = 128 # StyleTTS2 style encoder output dim
             
+            # Modified: Integration of BOTH Pyannote (512) and StyleTTS2 (128)
+            # If we use style_encoder, we will concatenate its output with Pyannote embedding.
+            # So spkr_embed_dim should be 128 + 512 = 640 if we are using the concatenated version for spkr_linear.
+            # HOWEVER, self.spkr_linear projects to hidden_size (768).
+            # In original MQTTS, spkr_linear input is 512 (Pyannote).
+            
+            # Decision: spkr_linear will take the COMBINED embedding (640) -> hidden_size.
+            spkr_embed_dim = 128 + 512
+
             if self.style_encoder and hasattr(hp, 'style_encoder_ckpt') and hp.style_encoder_ckpt:
                 print(f"Loading style encoder weights from {hp.style_encoder_ckpt}")
                 ckpt = torch.load(hp.style_encoder_ckpt, map_location='cpu')
@@ -46,17 +62,35 @@ class Wav2TTS(pl.LightningModule):
                 elif 'model' in ckpt:
                      # Sometimes saved as model
                      state_dict = ckpt['model']
+                elif 'net' in ckpt:
+                     state_dict = ckpt['net']
                 else:
                      state_dict = ckpt
                 
                 # Filter keys for style_encoder
                 # StyleTTS2 keys usually start with 'style_encoder.'
                 new_state_dict = {}
-                for k, v in state_dict.items():
-                    if k.startswith('style_encoder.'):
-                        new_state_dict[k.replace('style_encoder.', '')] = v
-                    elif k.startswith('style_enc.'): # Potential variation
-                        new_state_dict[k.replace('style_enc.', '')] = v
+                
+                # Check if state_dict has nested style_encoder or if keys start with style_encoder.
+                if 'style_encoder' in state_dict and isinstance(state_dict['style_encoder'], dict):
+                     print("Found nested 'style_encoder' dict.")
+                     temp_dict = state_dict['style_encoder']
+                     for k, v in temp_dict.items():
+                         # Strip module. prefix if present
+                         if k.startswith('module.'):
+                             new_state_dict[k.replace('module.', '')] = v
+                         else:
+                             new_state_dict[k] = v
+                else:
+                     # Flat dictionary, look for prefixes
+                     for k, v in state_dict.items():
+                        if k.startswith('style_encoder.'):
+                            key_suffix = k.replace('style_encoder.', '')
+                            if key_suffix.startswith('module.'):
+                                key_suffix = key_suffix.replace('module.', '')
+                            new_state_dict[key_suffix] = v
+                        elif k.startswith('style_enc.'): 
+                            new_state_dict[k.replace('style_enc.', '')] = v
                 
                 if len(new_state_dict) > 0:
                     print(f"Found {len(new_state_dict)} keys for style encoder.")
@@ -66,6 +100,15 @@ class Wav2TTS(pl.LightningModule):
                 else:
                     print("No style encoder keys found in checkpoint. Initializing randomly.")
 
+
+        self.spkr_linear = nn.Linear(spkr_embed_dim, hp.hidden_size)
+        
+        # Adapter for Vocoder if using StyleEncoder
+        # Vocoder expects 512 dim.
+        # We concatenate Style (128) + Pyannote (512) = 640.
+        self.style_to_vocoder = None
+        if self.style_encoder:
+            self.style_to_vocoder = nn.Linear(128 + 512, 512)
 
         if self.hp.pretrained_path:
             self.load()
@@ -171,8 +214,17 @@ class Wav2TTS(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         #Deal with speaker embedding
         if self.style_encoder:
+             # For StyleEncoder, we need audio.
+             # batch['audio'] is available.
              style_embedding = self.style_encoder(batch['audio'])
-             speaker_embedding = F.normalize(style_embedding, dim=-1)
+             style_embedding = F.normalize(style_embedding, dim=-1)
+             
+             # We also need Pyannote embedding.
+             # batch['speaker'] contains the pre-computed embedding (Pyannote).
+             pyannote_embedding = F.normalize(batch['speaker'], dim=-1)
+             
+             # Concatenate
+             speaker_embedding = torch.cat([style_embedding, pyannote_embedding], dim=-1) # 640
         else:
              speaker_embedding = F.normalize(batch['speaker'], dim=-1)
         
@@ -180,8 +232,18 @@ class Wav2TTS(pl.LightningModule):
         
         #Deal with phone segments
         phone_features = self.phone_embedding(batch['phone'])
+        
+        # Extract Semantic Embeddings (SBERT)
+        # Batch has raw text in 'text' key if we updated seqCollate, but wait.
+        # Lightning passes `batch` which is the output of seqCollate.
+        # In QuantizeDataset.seqCollate, I added 'text' list.
+        # It is NOT converted to tensor, so it's a list of strings.
+        raw_texts = batch['text']
+        semantic_embedding = self.semantic_encoder(raw_texts) # (B, 384)
+        
         #Run decoder
         recons_segments = self.TTSdecoder(batch['tts_quantize_input'], phone_features, speaker_embedding_proj,
+                                          semantic_embedding,
                                           batch['quantize_mask'], batch['phone_mask'])
         target = recons_segments['logits'][~batch['quantize_mask']].view(-1, self.n_decode_codes)
         labels = batch['tts_quantize_output'][~batch['quantize_mask']].view(-1)
@@ -212,8 +274,19 @@ class Wav2TTS(pl.LightningModule):
             
             voc_input = batch['tts_quantize_input'][:, 1:]
             
+            # Replace padding values (which are n_codes=160) with a valid code (e.g. 0) to avoid embedding crash
+            # Vocoder Quantizer expects [0, n_codes-1]
+            voc_input = voc_input.clone()
+            voc_input[voc_input >= self.hp.n_codes] = 0
+            
+            # Adapt speaker embedding for vocoder if needed
+            voc_spkr = speaker_embedding # This is now 640 dim if style_encoder is active
+            
+            if self.style_to_vocoder is not None:
+                voc_spkr = self.style_to_vocoder(voc_spkr) # 640 -> 512
+            
             # Generate audio
-            audio_hat = self.vocoder(voc_input, speaker_embedding) # Pass normalized style embedding
+            audio_hat = self.vocoder(voc_input, voc_spkr) # Pass normalized style embedding
             
             # Get GT audio
             audio_gt = batch['audio'].unsqueeze(1) # N, 1, T
@@ -247,29 +320,29 @@ class Wav2TTS(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         #Batch size = 1
-        spkr, q_s, q_e, phone, ground_truth = batch
+        spkr, q_s, q_e, phone, ground_truth, raw_text = batch
         
-        # We need audio for style encoder in validation too, but validation_step signature in dataset returns it as ground_truth (5th element)
-        # QuantizeDatasetVal returns: (spkr, q_s, q_e, ph, audio)
-        # But wait, my modification to QuantizeDatasetVal.getitem returned:
-        # (speaker_embedding, quantization_s, quantization_e, phonemes, audio)
-        # So batch unpacking:
-        # spkr, q_s, q_e, phone, ground_truth = batch
-        # This matches.
+        # Extract Semantic Embedding
+        # raw_text is a tuple/list of 1 string (batch size 1)
+        if isinstance(raw_text, tuple):
+             raw_text = list(raw_text)
+        semantic_embedding = self.semantic_encoder(raw_text)
         
         if self.style_encoder:
              # ground_truth is the audio (N, T)
-             # We need to pass it to style_encoder.
-             # But ground_truth in validation might be just waveform.
-             # style_encoder expects (B, T)
              style_embedding = self.style_encoder(ground_truth)
-             norm_spkr = F.normalize(style_embedding, dim=-1)
+             style_norm = F.normalize(style_embedding, dim=-1)
+             
+             # batch['speaker'] (spkr) is Pyannote
+             pyannote_norm = F.normalize(spkr, dim=-1)
+             
+             norm_spkr = torch.cat([style_norm, pyannote_norm], dim=-1)
         else:
              norm_spkr = F.normalize(spkr, dim=-1)
              
         spkr_proj = self.spkr_linear(norm_spkr)
         phone_features = self.phone_embedding(phone)
-        recons_segments = self.TTSdecoder(q_s, phone_features, spkr_proj, None, None)
+        recons_segments = self.TTSdecoder(q_s, phone_features, spkr_proj, semantic_embedding, None, None)
         target = recons_segments['logits'].view(-1, self.n_decode_codes)
         labels = q_e.view(-1)
         loss = self.cross_entropy(target, labels)
@@ -281,11 +354,21 @@ class Wav2TTS(pl.LightningModule):
         if batch_idx in self.sample_idxs:
             batch_idx = self.sample_idxs.index(batch_idx)
             phone_mask = torch.full((phone_features.size(0), phone_features.size(1)), False, dtype=torch.bool, device=phone_features.device)
-            synthetic, infer_attn = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, spkr_proj, phone_mask, prior=None, output_alignment=True)
+            synthetic, infer_attn = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, spkr_proj, semantic_embedding, phone_mask, prior=None, output_alignment=True)
             synthetic = synthetic[0].unsqueeze(0)
-            synthetic = self.vocoder(synthetic, norm_spkr).float()
+            
+            # Handle padding for vocoder input in validation as well
+            # q_s has padding value n_codes.
+            voc_input_val = q_s[:, 1:].clone()
+            voc_input_val[voc_input_val >= self.hp.n_codes] = 0
+
+            voc_spkr = norm_spkr
+            if self.style_to_vocoder is not None:
+                 voc_spkr = self.style_to_vocoder(voc_spkr)
+            
+            synthetic = self.vocoder(synthetic, voc_spkr).float()
             #Reconstructed Audio with vocoder
-            reconstructed_gt = self.vocoder(q_s[:, 1:], norm_spkr).float()
+            reconstructed_gt = self.vocoder(voc_input_val, voc_spkr).float()
             #Write files
             sw = self.logger.experiment
             sw.add_audio(f'generated/{batch_idx}', synthetic, self.global_step, self.hp.sample_rate)

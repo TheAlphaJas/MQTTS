@@ -14,8 +14,9 @@ gdrive_files = {
     "config.json": ("1RkzZdSuXzWtSeAKccH45hGPUIusJLsCX", "ckpt/"),
     "g_00600000.ckpt": ("1XOtGWUlem8cG6PCyTyjHHtC5VvUogvlE", "quantizer/checkpoints/"),
     "last.ckpt": ("1JtzeY3kGVks1O1NgwwrYPyPxfDli9kc8", "ckpt/"),
+    "g_00036500": ("1RbLJZPRtfTLwqOb5WGcO1ZnEZoRhB8Cs", "quantizer/checkpoints/"),
     # Add MQTTS pretrained placeholder
-    "pretrained_mqtts.ckpt": ("", "ckpt/") # Placeholder ID
+    "pretrained_mqtts.ckpt": ("1rfXoqJ4Wb3Yj_ig4xKsluEF1Ugm9L0pf", "ckpt/") # Placeholder ID
 }
 
 # === Define Hugging Face files ===

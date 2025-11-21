@@ -1,71 +1,79 @@
 import torch
 import torch.nn as nn
-import torchaudio
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
+import torchaudio
 
-# Ref: StyleTTS2 models.py style encoder (inferred structure for compatibility)
-# It typically uses ResBlocks.
-# I'll use the exact structure if possible.
-# Based on common StyleTTS implementations:
+class DownsampleRes(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        # Stride 2 depthwise conv
+        self.conv = spectral_norm(nn.Conv2d(dim, dim, 3, 2, 1, groups=dim))
+        
+    def forward(self, x):
+        return self.conv(x)
 
 class ResBlock(nn.Module):
-    def __init__(self, channels):
+    def __init__(self, in_channels, out_channels, downsample=False):
         super().__init__()
-        self.convs = nn.Sequential(
-            nn.Conv2d(channels, channels, 3, 1, 1),
-            nn.ReLU(),
-            nn.Conv2d(channels, channels, 3, 1, 1),
-            nn.ReLU()
-        )
-
+        self.conv1 = spectral_norm(nn.Conv2d(in_channels, in_channels, 3, 1, 1))
+        self.conv2 = spectral_norm(nn.Conv2d(in_channels, out_channels, 3, 2 if downsample else 1, 1))
+        
+        # Checkpoint indicates conv1x1 has no bias
+        self.conv1x1 = spectral_norm(nn.Conv2d(in_channels, out_channels, 1, 1, 0, bias=False)) if in_channels != out_channels else None
+        
+        self.downsample = downsample
+        if downsample:
+            # DownsampleRes uses in_channels (applied before conv1x1 or on input)
+            self.downsample_res = DownsampleRes(in_channels)
+            
     def forward(self, x):
-        return x + self.convs(x)
+        sc = x
+        
+        # Apply downsample first (on in_channels)
+        if self.downsample:
+            sc = self.downsample_res(sc)
+            
+        # Then apply projection if needed
+        if self.conv1x1 is not None:
+            sc = self.conv1x1(sc)
+        
+        h = F.leaky_relu(x, 0.2)
+        h = self.conv1(h)
+        h = F.leaky_relu(h, 0.2)
+        h = self.conv2(h)
+             
+        return h + sc
 
 class StyleEncoder(nn.Module):
     def __init__(self, config=None):
         super().__init__()
-        # StyleTTS2 Style Encoder configuration often:
-        # input: mel spectrogram (80)
-        # layers: 
-        #   conv 1->channel (3x3)
-        #   AveragePooling or more convs with stride?
-        #   Usually uses standard Reference Encoder from generic TTS papers.
         
-        # I'll stick to a robust implementation that matches StyleTTS2 checkpoints.
-        # StyleTTS2 uses 80 mel channels.
+        self.shared = nn.ModuleList()
         
-        # To ensure we can load weights, I will define it flexibly or provide a loading hook.
+        # Block 0: Conv2d(1, 64)
+        self.shared.append(spectral_norm(nn.Conv2d(1, 64, 3, 1, 1)))
         
-        # Structure based on StyleTTS2 (yl4579):
-        self.n_mels = 80
-        self.style_dim = 128 # Default in StyleTTS2 config
+        # Block 1: 64 -> 128
+        self.shared.append(ResBlock(64, 128, downsample=True))
         
-        # Ref: https://github.com/yl4579/StyleTTS2/blob/main/models.py
-        # (Reconstructed from common knowledge of this repo)
+        # Block 2: 128 -> 256
+        self.shared.append(ResBlock(128, 256, downsample=True))
         
-        self.convs = nn.ModuleList([
-            nn.Conv2d(1, 32, 3, 1, 1),
-            nn.Conv2d(32, 32, 3, 2, 1),
-            nn.Conv2d(32, 64, 3, 1, 1),
-            nn.Conv2d(64, 64, 3, 2, 1),
-            nn.Conv2d(64, 128, 3, 1, 1),
-            nn.Conv2d(128, 128, 3, 2, 1)
-        ])
+        # Block 3: 256 -> 512
+        self.shared.append(ResBlock(256, 512, downsample=True))
         
-        self.batch_norms = nn.ModuleList([
-            nn.BatchNorm2d(32),
-            nn.BatchNorm2d(32),
-            nn.BatchNorm2d(64),
-            nn.BatchNorm2d(64),
-            nn.BatchNorm2d(128),
-            nn.BatchNorm2d(128)
-        ])
+        # Block 4: 512 -> 512 (Downsample, but no conv1x1 as in=out)
+        self.shared.append(ResBlock(512, 512, downsample=True))
         
-        # StyleTTS2 uses a GRU after convs
-        # Input dim to GRU: 128 * (80 // 2^3) = 128 * 10 = 1280
-        self.gru_dim = 128 * (self.n_mels // 8)
-        self.gru = nn.GRU(self.gru_dim, 512, batch_first=True) # 512 hidden
-        self.projection = nn.Linear(512, 128) # Output style dim
+        # Block 5: Identity (placeholder for missing module.shared.5)
+        self.shared.append(nn.Identity())
+        
+        # Block 6: Conv2d(512, 512, 5, 1, 0)
+        self.shared.append(spectral_norm(nn.Conv2d(512, 512, 5, 1, 0)))
+        
+        # Unshared
+        self.unshared = nn.Linear(512, 128)
         
         self.to_mel = torchaudio.transforms.MelSpectrogram(
             sample_rate=24000,
@@ -78,26 +86,33 @@ class StyleEncoder(nn.Module):
         )
 
     def forward(self, x):
-        # x can be raw audio or mel.
-        # If x is (B, T), compute mel.
-        if x.ndim == 2:
-            with torch.no_grad():
-                x = self.to_mel(x)
-                x = torch.log(torch.clamp(x, min=1e-5))
+        # x: (B, T) audio
+        with torch.no_grad():
+             x = self.to_mel(x)
+             x = torch.log(torch.clamp(x, min=1e-5))
         
+        # Check for minimum length (need 80 frames for 4 downsamples + 5x5 conv)
+        # 80 / 16 = 5.
+        if x.size(-1) < 80:
+            pad_size = 80 - x.size(-1)
+            x = F.pad(x, (0, pad_size))
+            
         # x: (B, 80, T)
         x = x.unsqueeze(1) # (B, 1, 80, T)
         
-        for conv, bn in zip(self.convs, self.batch_norms):
-            x = F.relu(bn(conv(x)))
-            
-        # x: (B, 128, 10, T')
-        B, C, F_dim, T_dim = x.shape
-        x = x.permute(0, 3, 1, 2).reshape(B, T_dim, C * F_dim)
-        
-        _, h = self.gru(x)
-        # h: (1, B, 512)
-        h = h.squeeze(0)
-        
-        return self.projection(h)
+        for layer in self.shared:
+            if isinstance(layer, ResBlock):
+                x = layer(x)
+            elif isinstance(layer, nn.Identity):
+                pass
+            else:
+                x = layer(x)
+                if isinstance(layer, nn.Conv2d):
+                     x = F.leaky_relu(x, 0.2)
 
+        # x: (B, 512, 1, T')
+        x = x.flatten(2) # (B, 512, T')
+        x = x.mean(dim=2) # Global average pooling over time
+        
+        x = self.unshared(x)
+        return x
