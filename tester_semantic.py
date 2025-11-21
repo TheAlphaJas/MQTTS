@@ -6,11 +6,12 @@ from modules.wildttstransformer import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from torch.utils import data
 from modules.vocoder import Vocoder
-from modules.style_encoder import StyleEncoder
 import soundfile as sf
 import librosa
 from librosa.util import normalize
 from pyannote.audio import Inference
+from modules.style_encoder import StyleEncoder
+from modules.text_encoder import SemanticEncoder
 import random
 from tqdm import tqdm
 
@@ -20,29 +21,38 @@ class Wav2TTS_infer(nn.Module):
         self.hp = hp
         self.hp.init = 'std'
         self.TTSdecoder = TTSDecoder(hp, len(self.hp.phoneset))
-        self.spkr_linear = nn.Linear(512, hp.hidden_size)
+        
+        # Updated dimension for spkr_linear (Style + Pyannote)
+        self.spkr_embed_dim = 512
+        self.style_encoder = None
+        # Check config/args for style encoder usage. Assuming inference uses same config as training.
+        if hasattr(hp, 'style_encoder_type') and hp.style_encoder_type == 'style_tts2':
+            self.style_encoder = StyleEncoder()
+            self.spkr_embed_dim = 128 + 512
+
+        self.spkr_linear = nn.Linear(self.spkr_embed_dim, hp.hidden_size)
         self.phone_embedding = nn.Embedding(len(self.hp.phoneset), hp.hidden_size, padding_idx=self.hp.phoneset.index('<pad>'))
         
-        # Style Encoder support (optional, matching trainer logic)
-        self.style_encoder = None
-        if hasattr(hp, 'style_encoder_type') and hp.style_encoder_type == 'style_tts2':
-             self.style_encoder = StyleEncoder()
-             # If style encoder is used, spkr_linear needs to match training config (e.g. 640 -> hidden)
-             # But here we initialized it as 512 -> hidden above.
-             # If you are running inference on a model trained WITH style encoder, you must match it.
-             # Assuming the checkpoint loading will handle weight mismatch errors or we should adjust here.
-             # Let's adjust to be safe if config says so.
-             self.spkr_linear = nn.Linear(128 + 512, hp.hidden_size)
-
+        self.semantic_encoder = SemanticEncoder(device='cuda')
+        
+        self.load()
+        self.spkr_embedding = Inference("pyannote/embedding", window="whole")
+        self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path, with_encoder=True)
+        
         # Adapter for Vocoder
         self.style_to_vocoder = None
         if self.style_encoder:
             self.style_to_vocoder = nn.Linear(128 + 512, 512)
 
-        self.load()
-        self.spkr_embedding = Inference("pyannote/embedding", window="whole")
-        self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path, with_encoder=True)
-        
+        # Reload style_to_vocoder from checkpoint if it exists
+        state_dict = torch.load(self.hp.model_path)['state_dict']
+        if self.style_to_vocoder and 'style_to_vocoder.weight' in state_dict:
+            print("Loading style_to_vocoder from checkpoint")
+            self.style_to_vocoder.load_state_dict({
+                'weight': state_dict['style_to_vocoder.weight'],
+                'bias': state_dict['style_to_vocoder.bias']
+            })
+
     def load(self):
         state_dict = torch.load(self.hp.model_path)['state_dict']
         model_dict = self.state_dict()
@@ -55,49 +65,59 @@ class Wav2TTS_infer(nn.Module):
                 new_state_dict[k] = v
         print(self.load_state_dict(new_state_dict, strict=False))
 
-    def forward(self, wavs, phones):
+    def forward(self, wavs, phones, texts):
         self.eval()
         with torch.no_grad():
             batch_size = len(wavs)
+            
+            # 1. Speaker Embeddings
             speaker_embeddings = []
             style_embeddings = []
             
             for wav in wavs:
                 if self.hp.spkr_embedding_path:
-                    speaker_embeddings.append(np.load(wav))
+                     # Assuming spkr_embedding_path is for Pyannote
+                     # Logic for style encoder inference from file?
+                     # If we use style encoder, we need raw audio.
+                     # wavs contains raw audio (loaded in infer.py) or paths.
+                     # infer.py loads audio if spkr_embedding_path is None.
+                     pass
                 else:
-                    # If wav is a path string
-                    if isinstance(wav, str):
-                        audio, sr = sf.read(wav)
-                        wav = audio # Assumes correct SR or handling elsewhere (infer.py does it)
-                    
-                    wav = normalize(wav) * 0.95
-                    wav_torch = torch.FloatTensor(wav).unsqueeze(0)
-                    
-                    # Pyannote
-                    spk_emb = self.spkr_embedding({'waveform': wav_torch, 'sample_rate': self.hp.sample_rate})
-                    speaker_embeddings.append(spk_emb)
-                    
-                    # Style Encoder
-                    if self.style_encoder:
-                        style_emb = self.style_encoder(wav_torch.cuda())
-                        style_embeddings.append(style_emb)
+                     # wav is numpy array of audio
+                     w = normalize(wav) * 0.95
+                     w_torch = torch.FloatTensor(w).unsqueeze(0)
+                     
+                     # Pyannote
+                     spk_emb = self.spkr_embedding({'waveform': w_torch, 'sample_rate': self.hp.sample_rate})
+                     speaker_embeddings.append(spk_emb)
+                     
+                     # Style Encoder
+                     if self.style_encoder:
+                         style_emb = self.style_encoder(w_torch.cuda())
+                         style_embeddings.append(style_emb)
 
             speaker_embeddings = torch.cuda.FloatTensor(np.array(speaker_embeddings))
             norm_spkr = F.normalize(speaker_embeddings, dim=-1)
             
-            if self.style_encoder and len(style_embeddings) > 0:
-                 style_embeddings = torch.cat(style_embeddings, dim=0)
-                 norm_style = F.normalize(style_embeddings, dim=-1)
-                 combined_spkr = torch.cat([norm_style, norm_spkr], dim=-1)
-                 speaker_embedding = self.spkr_linear(combined_spkr)
-                 voc_spkr = combined_spkr
-                 if self.style_to_vocoder:
-                     voc_spkr = self.style_to_vocoder(voc_spkr)
+            if self.style_encoder:
+                style_embeddings = torch.cat(style_embeddings, dim=0)
+                norm_style = F.normalize(style_embeddings, dim=-1)
+                combined_spkr = torch.cat([norm_style, norm_spkr], dim=-1)
+                
+                # Project for Transformer
+                speaker_embedding_proj = self.spkr_linear(combined_spkr)
+                
+                # Project for Vocoder
+                voc_spkr = combined_spkr
+                if self.style_to_vocoder:
+                    voc_spkr = self.style_to_vocoder(combined_spkr)
             else:
-                 speaker_embedding = self.spkr_linear(norm_spkr)
-                 voc_spkr = norm_spkr
-
+                speaker_embedding_proj = self.spkr_linear(norm_spkr)
+                voc_spkr = norm_spkr
+            
+            # 2. Semantic Embeddings
+            semantic_embeddings = self.semantic_encoder(texts)
+            
             low_background_noise = torch.randn(batch_size, int(self.hp.sample_rate * 5.0)) * self.hp.prior_noise_level
             base_prior = self.vocoder.encode(low_background_noise.cuda())
             if self.hp.clean_speech_prior:
@@ -121,7 +141,10 @@ class Wav2TTS_infer(nn.Module):
             phone_masks = torch.cuda.BoolTensor(phone_masks)
             phone_features = torch.cuda.LongTensor(phone_features)
             phone_features = self.phone_embedding(phone_features)
-            synthetic = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, speaker_embedding, phone_masks, prior=prior)
+            
+            # Pass semantic embeddings to inference
+            synthetic = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, speaker_embedding_proj, semantic_embeddings, phone_masks, prior=prior)
+            
             padded_synthetic, lengths = [], []
             maxlen = max([len(x) for x in synthetic])
             for i, s in enumerate(synthetic):
@@ -134,6 +157,8 @@ class Wav2TTS_infer(nn.Module):
                     s = torch.cat([s, pad], 0)
                 padded_synthetic.append(s)
             padded_synthetic = torch.stack(padded_synthetic, 0)
+            
+            # Use correct speaker embedding for vocoder
             synthetic = self.vocoder(padded_synthetic, voc_spkr)
             outputs = []
             for l, s in zip(lengths, synthetic):

@@ -1,11 +1,13 @@
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.filterwarnings("ignore", message="torchaudio._backend.set_audio_backend has been deprecated")
 import sys
-# Add parent directory to path to import modules
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
 
 import itertools
 import os
+# Add parent directory to path to import modules
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 import time
 import argparse
 import json
@@ -182,7 +184,8 @@ def train(rank, a, h):
     trainset = MelDatasetJoint(training_filelist, h.segment_size, h.n_fft, h.num_mels,
                           h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, n_cache_reuse=0,
                           shuffle=False if h.num_gpus > 1 else True, fmax_loss=h.fmax_for_loss, device=device,
-                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir, style_segment_size=32000)
+                          fine_tuning=a.fine_tuning, base_mels_path=a.input_mels_dir, style_segment_size=32000,
+                          speaker_embedding_dir=a.speaker_embedding_dir)
 
     train_sampler = DistributedSampler(trainset) if h.num_gpus > 1 else None
 
@@ -193,10 +196,12 @@ def train(rank, a, h):
                               drop_last=True)
 
     if rank == 0:
+        os.makedirs(os.path.join(a.checkpoint_path, 'logs'), exist_ok=True)
         validset = MelDatasetJoint(validation_filelist, h.segment_size, h.n_fft, h.num_mels,
                               h.hop_size, h.win_size, h.sampling_rate, h.fmin, h.fmax, False, False, n_cache_reuse=0,
                               fmax_loss=h.fmax_for_loss, device=device, fine_tuning=a.fine_tuning,
-                              base_mels_path=a.input_mels_dir, style_segment_size=32000)
+                              base_mels_path=a.input_mels_dir, style_segment_size=32000,
+                              speaker_embedding_dir=a.speaker_embedding_dir)
         validation_loader = DataLoader(validset, num_workers=1, shuffle=False,
                                        sampler=None,
                                        batch_size=1,
@@ -253,6 +258,11 @@ def train(rank, a, h):
             
             y_g_hat = generator(q, spkr_proj)
             
+            # Trim audio to min length
+            min_audio_len = min(y.size(2), y_g_hat.size(2))
+            y = y[:, :, :min_audio_len]
+            y_g_hat = y_g_hat[:, :, :min_audio_len]
+            
             y_g_hat_mel = mel_spectrogram(y_g_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size,
                                           h.fmin, h.fmax_for_loss)
 
@@ -275,6 +285,11 @@ def train(rank, a, h):
             optim_g.zero_grad()
 
             # L1 Mel-Spectrogram Loss
+            # Trim to min length to avoid mismatches (e.g. 40 vs 41 frames)
+            min_mel_len = min(y_mel.size(2), y_g_hat_mel.size(2))
+            y_mel = y_mel[:, :, :min_mel_len]
+            y_g_hat_mel = y_g_hat_mel[:, :, :min_mel_len]
+            
             loss_mel = F.l1_loss(y_mel, y_g_hat_mel) * 45
 
             y_df_hat_r, y_df_hat_g, fmap_f_r, fmap_f_g = mpd(y, y_g_hat)
@@ -391,20 +406,21 @@ def main():
     parser = argparse.ArgumentParser()
 
     parser.add_argument('--group_name', default=None)
-    parser.add_argument('--input_wavs_dir', default='../datasets/audios')
+    parser.add_argument('--input_wavs_dir', default='../../../imp_back/datasets/audios')
     parser.add_argument('--input_mels_dir', default=None)
-    parser.add_argument('--input_training_file', default='../datasets/training.txt')
-    parser.add_argument('--input_validation_file', default='../datasets/validation.txt')
+    parser.add_argument('--input_training_file', default='../../../imp_back/datasets/training.txt')
+    parser.add_argument('--input_validation_file', default='../../../imp_back/datasets/validation.txt')
     parser.add_argument('--checkpoint_path', default='checkpoints')
-    parser.add_argument('--config', default='')
+    parser.add_argument('--config', default='./config.json')
     parser.add_argument('--training_epochs', default=200, type=int)
-    parser.add_argument('--stdout_interval', default=5, type=int)
-    parser.add_argument('--checkpoint_interval', default=5000, type=int)
-    parser.add_argument('--summary_interval', default=100, type=int)
+    parser.add_argument('--stdout_interval', default=100, type=int)
+    parser.add_argument('--checkpoint_interval', default=10, type=int)
+    parser.add_argument('--summary_interval', default=1, type=int)
     parser.add_argument('--validation_interval', default=10000, type=int)
     parser.add_argument('--fine_tuning', default=False, type=bool)
     parser.add_argument('--checkpoint_file', default=None)
     parser.add_argument('--style_encoder_ckpt', default=None, help="Path to StyleTTS2 checkpoint for Style Encoder initialization")
+    parser.add_argument('--speaker_embedding_dir', default=None, help="Path to directory containing pre-computed Pyannote embeddings")
 
     a = parser.parse_args()
 

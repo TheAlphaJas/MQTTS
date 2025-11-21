@@ -10,6 +10,7 @@ from modules.wildttstransformer import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from modules.vocoder import Vocoder
 from modules.style_encoder import StyleEncoder
+from modules.text_encoder import SemanticEncoder
 from quantizer.meldataset import mel_spectrogram
 from torch.utils import data
 import pytorch_lightning.core.module as pl
@@ -36,7 +37,10 @@ class Wav2TTS(pl.LightningModule):
             print(f"[NOTE] Using pre-computed speaker embeddings from {hp.speaker_embedding_dir}")
         else:
             print("[NOTE] Computing speaker embeddings on-the-fly (if Pyannote is available/enabled)")
-
+        
+        # Semantic Encoder (SBERT)
+        self.semantic_encoder = SemanticEncoder(device='cuda') # Will be moved to correct device by Lightning
+        
         # Style Encoder
         self.style_encoder = None
         if hasattr(hp, 'style_encoder_type') and hp.style_encoder_type == 'style_tts2':
@@ -127,73 +131,7 @@ class Wav2TTS(pl.LightningModule):
         #   Step 2: Load MQTTS weights (which doesn't have StyleEncoder keys) into the rest of the model.
         #   Result: Mixed model. 
         
-        # Initialize Vocoder structure first (don't load weights yet if using pretrained_path logic)
-        # If we have a vocoder_ckpt_path, we can load it. If NOT, we rely on self.load() to fill it.
-        # But Vocoder class init loads weights immediately.
-        # We need to defer or re-load.
-        # Let's Initialize randomly first? Or modify Vocoder to accept None?
-        # Assuming standard MQTTS Vocoder, it needs a config path.
-        # Let's modify modules/vocoder.py to check if ckpt_path is None.
-        # But I am modifying trainer.py here.
-        
-        # Strategy:
-        # 1. Init Vocoder. If hp.vocoder_ckpt_path is None, we need a way to init structure without loading.
-        #    But modules/vocoder.py requires ckpt for config? No, config_path is separate.
-        #    Let's assume modules/vocoder.py loads weights from ckpt_path.
-        
-        # If hp.vocoder_ckpt_path is provided -> Use it.
-        # If NOT provided -> We rely on pretrained_path. But we need to init the structure.
-        # We can use a dummy ckpt path or just init generator/quantizer manually?
-        # Actually, modules/vocoder.py:
-        # ckpt = torch.load(ckpt_path)
-        # ...
-        # self.generator.load_state_dict(ckpt['generator'])
-        
-        # If I cannot change modules/vocoder.py easily right now (I can, but let's see).
-        # Better: Initialize Vocoder using the config.
-        # If hp.vocoder_ckpt_path is None, we might fail unless we patch Vocoder.
-        # I will modify modules/vocoder.py to make ckpt_path optional.
-        
         self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path)
-        
-        if self.hp.pretrained_path:
-            print(f"[NOTE] Loading pretrained TTS checkpoint from {self.hp.pretrained_path}")
-            self.load()
-            print("[NOTE] Pretrained TTS checkpoint loaded.")
-            
-            # Check if vocoder was actually loaded from this checkpoint
-            ckpt = torch.load(self.hp.pretrained_path, map_location='cpu')
-            if 'model_state_dict' in ckpt:
-                state_dict = ckpt['model_state_dict']
-            elif 'state_dict' in ckpt:
-                state_dict = ckpt['state_dict']
-            else:
-                state_dict = ckpt
-                
-            # Basic check for generator keys (part of vocoder)
-            has_vocoder_params = any(k.startswith('vocoder.generator') or k.startswith('generator') for k in state_dict.keys())
-            
-            if has_vocoder_params:
-                print(f"[NOTE] Vocoder parameters FOUND in pretrained checkpoint: {self.hp.pretrained_path}. Using them (unless overridden).")
-            else:
-                print(f"[NOTE] Vocoder parameters NOT found in pretrained checkpoint: {self.hp.pretrained_path}. Vocoder might be uninitialized!")
-
-        # Override logic:
-        if hp.vocoder_ckpt_path is not None:
-            print(f"[NOTE] Overriding Vocoder weights from explicit path: {hp.vocoder_ckpt_path}")
-            ckpt = torch.load(hp.vocoder_ckpt_path)
-            self.vocoder.generator.load_state_dict(ckpt['generator'])
-            self.vocoder.quantizer.load_state_dict(ckpt['quantizer'])
-            if hasattr(self.vocoder, 'encoder') and 'encoder' in ckpt:
-                 self.vocoder.encoder.load_state_dict(ckpt['encoder'])
-        else:
-            print("[NOTE] No specific vocoder checkpoint provided via --vocoder_ckpt_path.")
-            if not self.hp.pretrained_path:
-                 print("[NOTE] WARNING: Neither pretrained_path nor vocoder_ckpt_path provided. Vocoder is random!")
-            elif not has_vocoder_params:
-                 print("[NOTE] WARNING: Pretrained path provided but contained no vocoder params. Vocoder is random!")
-            else:
-                 print("[NOTE] Using vocoder weights loaded from pretrained_path.")
         
         if hasattr(hp, 'fine_tune_vocoder') and hp.fine_tune_vocoder:
             print("Fine-tuning vocoder enabled.")
@@ -307,8 +245,18 @@ class Wav2TTS(pl.LightningModule):
         
         #Deal with phone segments
         phone_features = self.phone_embedding(batch['phone'])
+        
+        # Extract Semantic Embeddings (SBERT)
+        # Batch has raw text in 'text' key if we updated seqCollate, but wait.
+        # Lightning passes `batch` which is the output of seqCollate.
+        # In QuantizeDataset.seqCollate, I added 'text' list.
+        # It is NOT converted to tensor, so it's a list of strings.
+        raw_texts = batch['text']
+        semantic_embedding = self.semantic_encoder(raw_texts) # (B, 384)
+        
         #Run decoder
         recons_segments = self.TTSdecoder(batch['tts_quantize_input'], phone_features, speaker_embedding_proj,
+                                          semantic_embedding,
                                           batch['quantize_mask'], batch['phone_mask'])
         target = recons_segments['logits'][~batch['quantize_mask']].view(-1, self.n_decode_codes)
         labels = batch['tts_quantize_output'][~batch['quantize_mask']].view(-1)
@@ -390,15 +338,13 @@ class Wav2TTS(pl.LightningModule):
 
     def validation_step(self, batch, batch_idx):
         #Batch size = 1
-        spkr, q_s, q_e, phone, ground_truth = batch
+        spkr, q_s, q_e, phone, ground_truth, raw_text = batch
         
-        # We need audio for style encoder in validation too, but validation_step signature in dataset returns it as ground_truth (5th element)
-        # QuantizeDatasetVal returns: (spkr, q_s, q_e, ph, audio)
-        # But wait, my modification to QuantizeDatasetVal.getitem returned:
-        # (speaker_embedding, quantization_s, quantization_e, phonemes, audio)
-        # So batch unpacking:
-        # spkr, q_s, q_e, phone, ground_truth = batch
-        # This matches.
+        # Extract Semantic Embedding
+        # raw_text is a tuple/list of 1 string (batch size 1)
+        if isinstance(raw_text, tuple):
+             raw_text = list(raw_text)
+        semantic_embedding = self.semantic_encoder(raw_text)
         
         if self.style_encoder:
              # ground_truth is the audio (N, T)
@@ -414,7 +360,7 @@ class Wav2TTS(pl.LightningModule):
              
         spkr_proj = self.spkr_linear(norm_spkr)
         phone_features = self.phone_embedding(phone)
-        recons_segments = self.TTSdecoder(q_s, phone_features, spkr_proj, None, None)
+        recons_segments = self.TTSdecoder(q_s, phone_features, spkr_proj, semantic_embedding, None, None)
         target = recons_segments['logits'].view(-1, self.n_decode_codes)
         labels = q_e.view(-1)
         loss = self.cross_entropy(target, labels)
@@ -426,7 +372,7 @@ class Wav2TTS(pl.LightningModule):
         if batch_idx in self.sample_idxs:
             batch_idx = self.sample_idxs.index(batch_idx)
             phone_mask = torch.full((phone_features.size(0), phone_features.size(1)), False, dtype=torch.bool, device=phone_features.device)
-            synthetic, infer_attn = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, spkr_proj, phone_mask, prior=None, output_alignment=True)
+            synthetic, infer_attn = self.TTSdecoder.inference_topkp_sampling_batch(phone_features, spkr_proj, semantic_embedding, phone_mask, prior=None, output_alignment=True)
             synthetic = synthetic[0].unsqueeze(0)
             
             # Handle padding for vocoder input in validation as well

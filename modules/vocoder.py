@@ -7,18 +7,25 @@ import json
 class Vocoder(nn.Module):
     def __init__(self, config_path, ckpt_path, with_encoder=False):
         super(Vocoder, self).__init__()
-        ckpt = torch.load(ckpt_path)
         with open(config_path) as f:
             data = f.read()
         json_config = json.loads(data)
         self.h = AttrDict(json_config)
         self.quantizer = Quantizer(self.h)
         self.generator = Generator(self.h)
-        self.generator.load_state_dict(ckpt['generator'])
-        self.quantizer.load_state_dict(ckpt['quantizer'])
-        if with_encoder:
-            self.encoder = Encoder(self.h)
-            self.encoder.load_state_dict(ckpt['encoder'])
+        
+        if ckpt_path is not None:
+            print(f"Initializing Vocoder from {ckpt_path}")
+            ckpt = torch.load(ckpt_path)
+            self.generator.load_state_dict(ckpt['generator'])
+            self.quantizer.load_state_dict(ckpt['quantizer'])
+            if with_encoder:
+                self.encoder = Encoder(self.h)
+                self.encoder.load_state_dict(ckpt['encoder'])
+        else:
+            print("Initializing Vocoder with random weights (expecting load later)")
+            if with_encoder:
+                self.encoder = Encoder(self.h)
 
     def forward(self, x, spkr):
         return self.generator(self.quantizer.embed(x), spkr)

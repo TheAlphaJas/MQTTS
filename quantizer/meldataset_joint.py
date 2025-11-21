@@ -87,7 +87,8 @@ def get_dataset_filelist(a):
 class MelDatasetJoint(torch.utils.data.Dataset):
     def __init__(self, training_files, segment_size, n_fft, num_mels,
                  hop_size, win_size, sampling_rate,  fmin, fmax, split=True, shuffle=True, n_cache_reuse=1,
-                 device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None, style_segment_size=32000):
+                 device=None, fmax_loss=None, fine_tuning=False, base_mels_path=None, style_segment_size=32000,
+                 speaker_embedding_dir=None):
         self.audio_files = training_files
         random.seed(1234)
         if shuffle:
@@ -109,7 +110,9 @@ class MelDatasetJoint(torch.utils.data.Dataset):
         self.device = device
         self.fine_tuning = fine_tuning
         self.base_mels_path = base_mels_path
-        self.spkr_embedding = Inference("pyannote/embedding", window="whole")
+        self.speaker_embedding_dir = speaker_embedding_dir
+        if self.speaker_embedding_dir is None:
+            self.spkr_embedding = Inference("pyannote/embedding", window="whole")
 
     def __getitem__(self, index):
         filename = self.audio_files[index]
@@ -135,16 +138,31 @@ class MelDatasetJoint(torch.utils.data.Dataset):
         audio = torch.FloatTensor(audio)
         audio = audio.unsqueeze(0) # 1, T
         
-        # Extract Pyannote embedding from the full audio
-        # Note: Inference usually takes raw waveform as torch tensor or numpy
-        # MQTTS original uses {'waveform': ..., 'sample_rate': ...}
-        try:
-            pyannote_emb = self.spkr_embedding({'waveform': audio, 'sample_rate': self.sampling_rate})
-            pyannote_emb = torch.from_numpy(pyannote_emb).float()
-            pyannote_emb = torch.nn.functional.normalize(pyannote_emb, dim=0)
-        except Exception as e:
-            print(f"Error extracting pyannote embedding for {filename}: {e}")
-            pyannote_emb = torch.zeros(512)
+        # Extract Pyannote embedding
+        pyannote_emb = None
+        if self.speaker_embedding_dir:
+            try:
+                # Check filename in list
+                # audio_files has full path. get basename
+                base_name = os.path.splitext(os.path.basename(filename))[0]
+                emb_path = os.path.join(self.speaker_embedding_dir, base_name + '.npy')
+                pyannote_emb = np.load(emb_path)
+                pyannote_emb = torch.from_numpy(pyannote_emb).float()
+                pyannote_emb = torch.nn.functional.normalize(pyannote_emb, dim=0)
+            except Exception as e:
+                print(f"Error loading pre-computed embedding for {filename}: {e}")
+                # Fallback? Or zeros
+                pyannote_emb = torch.zeros(512)
+        
+        if pyannote_emb is None:
+            # Compute on fly
+            try:
+                pyannote_emb = self.spkr_embedding({'waveform': audio, 'sample_rate': self.sampling_rate})
+                pyannote_emb = torch.from_numpy(pyannote_emb).float()
+                pyannote_emb = torch.nn.functional.normalize(pyannote_emb, dim=0)
+            except Exception as e:
+                print(f"Error extracting pyannote embedding for {filename}: {e}")
+                pyannote_emb = torch.zeros(512)
 
         # Use full audio for style extraction preparation? 
         # We need to crop a segment for style.
@@ -176,12 +194,8 @@ class MelDatasetJoint(torch.utils.data.Dataset):
                                   self.sampling_rate, self.hop_size, self.win_size, self.fmin, self.fmax,
                                   center=False)
         else:
-            # Fine tuning logic (simplified, assumes we use mels from disk but still need audio for style?)
-            # Original code loaded mel from disk.
-            # For joint training, we likely aren't in fine_tuning mode usually.
-            # But if we are, we need to handle it.
-            # Just keep original logic for mel/audio_tgt, and pad audio_style.
-            
+            # Pre-extracted mels logic (for fine-tuning or speed)
+            # Load pre-computed Mel
             mel = np.load(
                 os.path.join(self.base_mels_path, os.path.splitext(os.path.split(filename)[-1])[0] + '.npy'))
             mel = torch.from_numpy(mel)
@@ -200,8 +214,21 @@ class MelDatasetJoint(torch.utils.data.Dataset):
                     mel = torch.nn.functional.pad(mel, (0, frames_per_seg - mel.size(2)), 'constant')
                     audio_tgt = torch.nn.functional.pad(audio_tgt, (0, self.segment_size - audio_tgt.size(1)), 'constant')
             
-            # For style, we still crop from full audio if possible? 
-            # fine_tuning mode assumes cached_wav is available.
+            # Even when loading pre-computed mels, we must normalize the audio to match 
+            # the normalization used during pre-computation (usually normalize(audio) * 0.95).
+            # The original repo skipped this in fine_tuning=True, likely assuming 'audio' 
+            # loaded from disk was already processed or that fine-tuning required preserving dynamics.
+            # However, if we use this mode just for speed (loading cached mels), 
+            # we MUST ensure the ground truth audio is also normalized, otherwise the
+            # discriminator (seeing normalized-generated vs unnormalized-real) will collapse.
+            # We assume standard training behavior here.
+            audio_tgt = normalize(audio_tgt.squeeze().numpy()) * 0.95
+            audio_tgt = torch.from_numpy(audio_tgt).unsqueeze(0)
+            
+            # Style audio also needs normalization? Style encoder usually robust, but better consistent.
+            audio_style = normalize(audio_style.squeeze().numpy()) * 0.95
+            audio_style = torch.from_numpy(audio_style).unsqueeze(0)
+
             if audio_style.size(1) >= self.style_segment_size:
                 max_style_start = audio_style.size(1) - self.style_segment_size
                 style_start = random.randint(0, max_style_start)

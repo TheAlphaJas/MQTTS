@@ -4,16 +4,16 @@ warnings.filterwarnings("ignore", message="torchaudio._backend.set_audio_backend
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from trainer import Wav2TTS
+# Import from semantic trainer
+from trainer_semantic import Wav2TTS
 from pytorch_lightning.strategies import DDPStrategy
 import argparse
 import json
 import os
 import torch
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning)
-
 torch.set_float32_matmul_precision('medium')
+
+
 
 parser = argparse.ArgumentParser()
 
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     parser.add_argument('--saving_path', type=str, default='./ckpt')
     parser.add_argument('--resume_checkpoint', type=str, default=None)
     parser.add_argument('--vocoder_config_path', type=str, required=True)
-    parser.add_argument('--vocoder_ckpt_path', type=str, default=None)
+    parser.add_argument('--vocoder_ckpt_path', type=str, required=True)
     parser.add_argument('--datadir', type=str, required=True)
     parser.add_argument('--metapath', type=str, required=True)
     parser.add_argument('--val_metapath', type=str, required=True)
@@ -117,7 +117,7 @@ if __name__ == "__main__":
         save_last=True
     )
 
-    logger = TensorBoardLogger(args.sampledir, name="JS-MQ-TTS", version=args.version)
+    logger = TensorBoardLogger(args.sampledir, name="VQ-TTS-Semantic", version=args.version)
 
     val_interval = args.val_check_interval
     if val_interval > 1.0:

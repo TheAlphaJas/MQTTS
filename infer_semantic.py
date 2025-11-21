@@ -1,6 +1,8 @@
+import warnings
+warnings.filterwarnings("ignore", message="torchaudio._backend.set_audio_backend has been deprecated")
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
-from tester import Wav2TTS_infer
+from tester_semantic import Wav2TTS_infer
 import argparse
 from dp.phonemizer import Phonemizer
 import soundfile as sf
@@ -78,13 +80,17 @@ if __name__ == '__main__':
         i_phones.append(phones)
         if len(i_wavs) == args.batch_size:
             print (f"Inferencing batch {written//args.batch_size+1}, total {len(input_file)//args.batch_size+1} baches.")
-            synthetic = model(i_wavs, i_phones)
+            # Pass sentences (text) to model as well
+            sentences_batch = [item[1] for item in input_file[written:written+args.batch_size]]
+            synthetic = model(i_wavs, i_phones, sentences_batch)
             for s in synthetic:
                 sf.write(os.path.join(args.outputdir, f'sentence-{written+1}-1.wav'), s, args.sample_rate)
                 written += 1
             i_wavs, i_phones = [], []
     if len(i_wavs) > 0:
-        synthetic = model(i_wavs, i_phones)
+        # Remaining batch
+        sentences_batch = [item[1] for item in input_file[written:]]
+        synthetic = model(i_wavs, i_phones, sentences_batch)
         for s in synthetic:
             sf.write(os.path.join(args.outputdir, f'sentence-{written+1}-1.wav'), s, args.sample_rate)
             written += 1
