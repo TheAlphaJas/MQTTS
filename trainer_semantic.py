@@ -4,13 +4,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from data.QuantizeDataset import QuantizeDataset, QuantizeDatasetVal
+from data.QuantizeDataset_semantic import QuantizeDataset, QuantizeDatasetVal
 from data.sampler import RandomBucketSampler
-from modules.wildttstransformer import TTSDecoder
+from modules.wildttstransformer_semantic import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from modules.vocoder import Vocoder
 from modules.style_encoder import StyleEncoder
 from modules.text_encoder import SemanticEncoder
+from modules.utmos_predictor import UTMOSPredictor, SpeakerEmbeddingSimilarityLoss
 from quantizer.meldataset import mel_spectrogram
 from torch.utils import data
 import pytorch_lightning.core.module as pl
@@ -100,10 +101,13 @@ class Wav2TTS(pl.LightningModule):
                 if len(new_state_dict) > 0:
                     print(f"Found {len(new_state_dict)} keys for style encoder.")
                     missing, unexpected = self.style_encoder.load_state_dict(new_state_dict, strict=False)
-                    print(f"Missing keys: {missing}")
-                    print(f"Unexpected keys: {unexpected}")
+                    print(f"[NOTE] StyleTTS2 weights loaded from {hp.style_encoder_ckpt}.")
+                    if len(missing) > 0:
+                        print(f"   Missing keys: {missing}")
+                    if len(unexpected) > 0:
+                        print(f"   Unexpected keys: {unexpected}")
                 else:
-                    print("No style encoder keys found in checkpoint. Initializing randomly.")
+                    print("[NOTE] No style encoder keys found in checkpoint. Initializing randomly.")
 
 
         self.spkr_linear = nn.Linear(spkr_embed_dim, hp.hidden_size)
@@ -114,9 +118,36 @@ class Wav2TTS(pl.LightningModule):
         self.style_to_vocoder = None
         if self.style_encoder:
             self.style_to_vocoder = nn.Linear(128 + 512, 512)
+            
+            # Attempt to load style_to_vocoder weights from vocoder_ckpt_path
+            # The vocoder_ckpt_path (from train_joint.py) contains 'style_to_vocoder' state_dict
+            if hasattr(hp, 'vocoder_ckpt_path') and hp.vocoder_ckpt_path:
+                 print(f"Loading style_to_vocoder weights from {hp.vocoder_ckpt_path}")
+                 try:
+                     ckpt = torch.load(hp.vocoder_ckpt_path, map_location='cpu')
+                     # Check key
+                     if 'style_to_vocoder' in ckpt:
+                         self.style_to_vocoder.load_state_dict(ckpt['style_to_vocoder'])
+                         print("Loaded style_to_vocoder weights.")
+                     else:
+                         print("[WARNING] 'style_to_vocoder' not found in vocoder checkpoint. Using random initialization.")
+                 except Exception as e:
+                     print(f"[WARNING] Failed to load style_to_vocoder from vocoder ckpt: {e}")
 
         if self.hp.pretrained_path:
             self.load()
+            # Check if the loaded checkpoint actually had style encoder weights (likely not if it was old MQTTS)
+            # If we loaded a checkpoint that DID include style encoder (e.g. resuming a semantic run), it might have overwritten what we loaded above.
+            # We should inform the user.
+            ckpt_keys = torch.load(self.hp.pretrained_path, map_location='cpu')['state_dict'].keys()
+            has_style_enc_in_ckpt = any('style_encoder' in k for k in ckpt_keys)
+            
+            if has_style_enc_in_ckpt:
+                 print(f"[NOTE] The provided pretrained_path '{self.hp.pretrained_path}' contained Style Encoder weights.")
+                 print("       These weights have OVERWRITTEN the StyleTTS2 initialization.")
+            else:
+                 print(f"[NOTE] The provided pretrained_path '{self.hp.pretrained_path}' did NOT contain Style Encoder weights.")
+                 print("       Keeping the StyleTTS2 initialization (or random if not provided).")
         else:
             self.apply(self.init_weights)
         
@@ -148,6 +179,35 @@ class Wav2TTS(pl.LightningModule):
             self.vocoder.generator.remove_weight_norm()
             for param in self.vocoder.parameters():
                 param.requires_grad = False
+            
+            # Also freeze style_to_vocoder if not fine-tuning
+            if self.style_to_vocoder:
+                self.style_to_vocoder.eval()
+                for param in self.style_to_vocoder.parameters():
+                    param.requires_grad = False
+        
+        # Initialize additional loss functions for optimization
+        # 1. Speaker Embedding Similarity Loss
+        self.use_speaker_similarity_loss = hasattr(hp, 'speaker_similarity_weight') and hp.speaker_similarity_weight > 0
+        if self.use_speaker_similarity_loss:
+            self.speaker_similarity_loss = SpeakerEmbeddingSimilarityLoss()
+            print(f"Speaker Embedding Similarity Loss enabled with weight: {hp.speaker_similarity_weight}")
+        
+        # 2. UTMOS MOS Score Loss
+        self.use_utmos_loss = hasattr(hp, 'utmos_weight') and hp.utmos_weight > 0
+        if self.use_utmos_loss:
+            utmos_ckpt = getattr(hp, 'utmos_ckpt_path', None)
+            if utmos_ckpt and os.path.exists(utmos_ckpt):
+                self.utmos_predictor = UTMOSPredictor(utmos_ckpt, device='cuda')
+                # Check if model actually loaded (it sets utmos_model to None on failure)
+                if hasattr(self.utmos_predictor, 'utmos_model') and self.utmos_predictor.utmos_model is None:
+                    print("[WARNING] UTMOS model failed to load (see errors above). UTMOS loss will be disabled.")
+                    self.use_utmos_loss = False
+                else:
+                    print(f"UTMOS Loss enabled with weight: {hp.utmos_weight}")
+            else:
+                print(f"[WARNING] UTMOS checkpoint not found at {utmos_ckpt}. UTMOS loss will be disabled.")
+                self.use_utmos_loss = False
 
     def load(self):
         state_dict = torch.load(self.hp.pretrained_path)['state_dict']
@@ -225,6 +285,9 @@ class Wav2TTS(pl.LightningModule):
         return [optimizer_adam], [scheduler_adam]
 
     def training_step(self, batch, batch_idx):
+        # Ensure semantic encoder is in eval mode (to disable dropout etc even if Lightning set it to train)
+        self.semantic_encoder.eval()
+        
         #Deal with speaker embedding
         if self.style_encoder:
              # For StyleEncoder, we need audio.
@@ -265,67 +328,179 @@ class Wav2TTS(pl.LightningModule):
         self.log("train/loss", loss, on_step=True, prog_bar=True)
         self.log("train/acc", acc, on_step=True, prog_bar=True)
         
+        # Store base loss for verbose logging
+        base_loss = loss.item()
+        
+        # Additional losses will be computed after generating audio (if needed)
+        additional_losses = {}
+        
         # Verbose logging
         if self.global_step % self.hp.verbose_step == 0 and self.global_step > 0:
-             msg = f"Epoch: {self.current_epoch} | Step: {self.global_step} | Loss: {loss.item():.4f} | Acc: {acc.item():.4f}"
+             msg = f"Epoch: {self.current_epoch} | Step: {self.global_step} | Loss: {base_loss:.4f} | Acc: {acc.item():.4f}"
              print(msg)
              if hasattr(self.hp, 'verbose_file') and self.hp.verbose_file:
                  with open(self.hp.verbose_file, 'a') as f:
                      f.write(f"{msg}\n")
 
+        # Generate audio for additional losses (speaker similarity & UTMOS)
+        # We need to generate audio regardless of vocoder fine-tuning if these losses are enabled
+        audio_hat = None
+        audio_gt = None
+        voc_spkr = None
+        
+        if self.use_speaker_similarity_loss or self.use_utmos_loss or (hasattr(self.hp, 'fine_tune_vocoder') and self.hp.fine_tune_vocoder):
+            # Use PREDICTED codes to generate audio (gradients will flow back to TTS model)
+            # recons_segments['logits'] has shape: (N, T, n_cluster_groups, n_decoder_codes)
+            # where n_cluster_groups = 4, n_decoder_codes = n_codes + special tokens
+            
+            try:
+                # Get predicted codes by taking argmax over last dimension
+                # Result shape: (N, T, 4)
+                predicted_codes = recons_segments['logits'].argmax(dim=-1)
+                
+                # Filter out padding using the mask
+                # batch['quantize_mask']: (N, T) - True where padded
+                # We need to keep the full sequence with padding for vocoder
+                # but clamp the codes to valid range
+                
+                # Clone to avoid in-place modification issues with autograd
+                voc_input = predicted_codes.clone()
+                
+                # Clamp to valid code range [0, n_codes-1]
+                # Any predicted special tokens (>=n_codes) get clamped to n_codes-1
+                voc_input = torch.clamp(voc_input, 0, self.hp.n_codes - 1)
+                
+                # Prepare speaker embedding for vocoder
+                voc_spkr = speaker_embedding  # This is now 640 dim if style_encoder is active
+                
+                if self.style_to_vocoder is not None:
+                    voc_spkr = self.style_to_vocoder(voc_spkr)  # 640 -> 512
+                
+                # Generate audio from predicted codes
+                # voc_input shape: (N, T, 4) - exactly what vocoder expects
+                audio_hat = self.vocoder(voc_input, voc_spkr)
+                
+                # Get GT audio
+                audio_gt = batch['audio']
+                if audio_gt.dim() == 2:
+                    audio_gt = audio_gt.unsqueeze(1)  # N, 1, T
+                
+                # Match lengths
+                min_len = min(audio_gt.shape[-1], audio_hat.shape[-1])
+                audio_gt = audio_gt[..., :min_len]
+                audio_hat = audio_hat[..., :min_len]
+                
+            except Exception as e:
+                print(f"[WARNING] Failed to generate audio for additional losses: {e}")
+                import traceback
+                traceback.print_exc()
+                audio_hat = None
+                audio_gt = None
+        
+        # Compute additional losses
+        # 1. Speaker Embedding Similarity Loss
+        if self.use_speaker_similarity_loss and audio_hat is not None and audio_gt is not None:
+            try:
+                spk_sim_loss, spk_sim_score = self.speaker_similarity_loss(
+                    audio_hat.squeeze(1), 
+                    audio_gt.squeeze(1), 
+                    sample_rate=self.hp.sample_rate
+                )
+                weighted_spk_loss = spk_sim_loss * self.hp.speaker_similarity_weight
+                loss = loss + weighted_spk_loss
+                
+                self.log("train/speaker_similarity_loss", spk_sim_loss, on_step=True, prog_bar=False)
+                self.log("train/speaker_similarity_score", spk_sim_score, on_step=True, prog_bar=False)
+                additional_losses['spk_sim'] = spk_sim_loss.item()
+                
+            except Exception as e:
+                print(f"[WARNING] Speaker similarity loss computation failed: {e}")
+        
+        # 2. UTMOS MOS Score Loss
+        if self.use_utmos_loss and audio_hat is not None:
+            try:
+                mos_loss, mos_score = self.utmos_predictor.compute_mos_loss(
+                    audio_hat.squeeze(1),
+                    sample_rate=self.hp.sample_rate,
+                    target_mos=getattr(self.hp, 'target_mos', 5.0)
+                )
+                weighted_mos_loss = mos_loss * self.hp.utmos_weight
+                loss = loss + weighted_mos_loss
+                
+                self.log("train/utmos_loss", mos_loss, on_step=True, prog_bar=False)
+                self.log("train/predicted_mos", mos_score, on_step=True, prog_bar=True)
+                additional_losses['utmos'] = mos_loss.item()
+                
+            except Exception as e:
+                print(f"[WARNING] UTMOS loss computation failed: {e}")
+        
         if hasattr(self.hp, 'fine_tune_vocoder') and self.hp.fine_tune_vocoder:
-            # Vocoder Fine-tuning logic
-            # Use GT codes: batch['tts_quantize_input'] (or output?)
-            # tts_quantize_input has Start Token?
-            # Let's use batch['tts_quantize_input'] excluding start token for better alignment?
-            # The vocoder typically trained on codes without start token if they represent audio frames.
-            # batch['tts_quantize_input'] is padded.
+            # Vocoder Fine-tuning logic using GT codes
+            # We already generated audio_hat from GT codes above (if additional losses are enabled)
+            # If not, we need to generate it here
             
-            # In validation_step, it uses: self.vocoder(q_s[:, 1:], norm_spkr)
-            # q_s is batch['tts_quantize_input'] (from QuantizeDataset).
-            # So we should use batch['tts_quantize_input'][:, 1:]
+            if audio_hat is None:
+                # Generate audio (wasn't generated for additional losses)
+                voc_input = batch['tts_quantize_input'][:, 1:].clone()
+                voc_input[voc_input >= self.hp.n_codes] = 0
+                
+                # Prepare speaker embedding
+                voc_spkr = speaker_embedding
+                if self.style_to_vocoder is not None:
+                    voc_spkr = self.style_to_vocoder(voc_spkr)
+                
+                audio_hat = self.vocoder(voc_input, voc_spkr)
+                
+                # Get GT audio
+                audio_gt = batch['audio']
+                if audio_gt.dim() == 2:
+                    audio_gt = audio_gt.unsqueeze(1)
+                
+                # Match lengths
+                min_len = min(audio_gt.shape[-1], audio_hat.shape[-1])
+                audio_gt = audio_gt[..., :min_len]
+                audio_hat = audio_hat[..., :min_len]
             
-            voc_input = batch['tts_quantize_input'][:, 1:]
-            
-            # Replace padding values (which are n_codes=160) with a valid code (e.g. 0) to avoid embedding crash
-            # Vocoder Quantizer expects [0, n_codes-1]
-            voc_input = voc_input.clone()
-            voc_input[voc_input >= self.hp.n_codes] = 0
-            
-            # Adapt speaker embedding for vocoder if needed
-            voc_spkr = speaker_embedding # This is now 640 dim if style_encoder is active
-            
-            if self.style_to_vocoder is not None:
-                voc_spkr = self.style_to_vocoder(voc_spkr) # 640 -> 512
-            
-            # Generate audio
-            audio_hat = self.vocoder(voc_input, voc_spkr) # Pass normalized style embedding
-            
-            # Get GT audio
-            audio_gt = batch['audio'].unsqueeze(1) # N, 1, T
-            
-            # Match lengths
-            min_len = min(audio_gt.shape[-1], audio_hat.shape[-1])
-            audio_gt = audio_gt[..., :min_len]
-            audio_hat = audio_hat[..., :min_len]
-            
-            # Compute Mel Loss
-            # Need self.vocoder.h params
-            h = self.vocoder.h
-            mel_gt = mel_spectrogram(audio_gt.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
-            mel_hat = mel_spectrogram(audio_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
-            
-            # Trim to min length to avoid mismatches
-            min_mel_len = min(mel_gt.size(2), mel_hat.size(2))
-            mel_gt = mel_gt[:, :, :min_mel_len]
-            mel_hat = mel_hat[:, :, :min_mel_len]
-            
-            loss_voc = F.l1_loss(mel_hat, mel_gt)
-            self.log("train/loss_voc", loss_voc, on_step=True, prog_bar=True)
-            
-            loss = loss + loss_voc
+            # Compute Mel Loss using the generated audio
+            if audio_hat is not None and audio_gt is not None:
+                h = self.vocoder.h
+                mel_gt = mel_spectrogram(audio_gt.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
+                mel_hat = mel_spectrogram(audio_hat.squeeze(1), h.n_fft, h.num_mels, h.sampling_rate, h.hop_size, h.win_size, h.fmin, h.fmax_for_loss)
+                
+                # Trim to min length to avoid mismatches
+                min_mel_len = min(mel_gt.size(2), mel_hat.size(2))
+                mel_gt = mel_gt[:, :, :min_mel_len]
+                mel_hat = mel_hat[:, :, :min_mel_len]
+                
+                loss_voc = F.l1_loss(mel_hat, mel_gt)
+                self.log("train/loss_voc", loss_voc, on_step=True, prog_bar=True)
+                
+                loss = loss + loss_voc
+                additional_losses['voc'] = loss_voc.item()
+        
+        # Enhanced verbose logging with additional losses
+        if self.global_step % self.hp.verbose_step == 0 and self.global_step > 0 and len(additional_losses) > 0:
+            extra_msg = " | ".join([f"{k}: {v:.4f}" for k, v in additional_losses.items()])
+            msg = f"Additional losses: {extra_msg}"
+            print(msg)
+            if hasattr(self.hp, 'verbose_file') and self.hp.verbose_file:
+                with open(self.hp.verbose_file, 'a') as f:
+                    f.write(f"{msg}\n")
             
         return loss
+
+    def on_train_epoch_start(self):
+        if self.trainer.is_global_zero:
+             try:
+                 # Estimate steps
+                 total_samples = len(self.data)
+                 batch_size = self.hp.batch_size
+                 world_size = getattr(self.trainer, 'world_size', 1)
+                 # Approximate steps
+                 steps = total_samples // (batch_size * world_size)
+                 print(f"\n[INFO] Epoch {self.current_epoch} started. Total samples: {total_samples}. Estimated steps per epoch: {steps}")
+             except:
+                 pass
 
     def on_validation_epoch_start(self):
         #For the first half samples, and random choose the rest half

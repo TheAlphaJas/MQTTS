@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from modules.wildttstransformer import TTSDecoder
+from modules.wildttstransformer_semantic import TTSDecoder
 from modules.transformers import TransformerEncoderLayer, TransformerEncoder, TransformerDecoder, TransformerDecoderLayer
 from torch.utils import data
 from modules.vocoder import Vocoder

@@ -34,7 +34,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=float, default=150)
     parser.add_argument('--train_bucket_size', type=int, default=8192)
-    parser.add_argument('--training_step', type=int, default=800000)
+    parser.add_argument('--training_step', type=int, default=8000000)
     parser.add_argument('--optim_flat_percent', type=float, default=0.0)
     parser.add_argument('--warmup_step', type=int, default=50)
     parser.add_argument('--adam_beta1', type=float, default=0.9)
@@ -92,9 +92,18 @@ if __name__ == "__main__":
     parser.add_argument('--style_encoder_type', type=str, choices=['style_tts2'], default=None)
     parser.add_argument('--style_encoder_ckpt', type=str, default=None)
     parser.add_argument('--fine_tune_vocoder', action='store_true')
-    parser.add_argument('--speaker_embedding_dir', type=str, default=None)
     parser.add_argument('--verbose_step', type=int, default=1000)
     parser.add_argument('--verbose_file', type=str, default='verbose.txt')
+    
+    #Additional Loss Functions for Quality Optimization
+    parser.add_argument('--speaker_similarity_weight', type=float, default=10.0, 
+                        help='Weight for speaker embedding cosine similarity loss (0.0 = disabled)')
+    parser.add_argument('--utmos_weight', type=float, default=10.0,
+                        help='Weight for UTMOS MOS score loss (0.0 = disabled)')
+    parser.add_argument('--utmos_ckpt_path', default='deps/UTMOS22/fairseq_checkpoints/wav2vec_small.pt', type=str,
+                        help='Path to pretrained UTMOS checkpoint for MOS prediction')
+    parser.add_argument('--target_mos', type=float, default=5.0,
+                        help='Target MOS score to optimize towards (default: 5.0)')
 
     args = parser.parse_args()
 
@@ -106,7 +115,7 @@ if __name__ == "__main__":
     # Setup strategy for distributed training
     strategy = None
     if args.distributed:
-        strategy = DDPStrategy(find_unused_parameters=False)
+        strategy = DDPStrategy(find_unused_parameters=True)
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.saving_path,
@@ -117,7 +126,7 @@ if __name__ == "__main__":
         save_last=True
     )
 
-    logger = TensorBoardLogger(args.sampledir, name="VQ-TTS-Semantic", version=args.version)
+    logger = TensorBoardLogger(args.sampledir, name="JS-MQ-TTS-Semantic", version=args.version)
 
     val_interval = args.val_check_interval
     if val_interval > 1.0:

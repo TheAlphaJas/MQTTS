@@ -413,7 +413,7 @@ def main():
     parser.add_argument('--checkpoint_path', default='checkpoints')
     parser.add_argument('--config', default='./config.json')
     parser.add_argument('--training_epochs', default=200, type=int)
-    parser.add_argument('--stdout_interval', default=100, type=int)
+    parser.add_argument('--stdout_interval', default=10, type=int)
     parser.add_argument('--checkpoint_interval', default=500, type=int)
     parser.add_argument('--summary_interval', default=10, type=int)
     parser.add_argument('--validation_interval', default=10000, type=int)

@@ -9,7 +9,7 @@ titw_audio_path = './titw-easy-audio/titw-easy-audio/'
 output_dir = './Data-out'
 
 # Splitting configuration
-SOURCE_DATA_SPLIT = 'dev' # The split to be partitioned into train/validation
+SOURCE_DATA_SPLIT = 'train' # The split to be partitioned into train/validation
 VALIDATION_SET_RATIO = 0.15 # Use 15% of the data for validation
 RANDOM_SEED = 42 # For reproducible splits
 
