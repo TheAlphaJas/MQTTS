@@ -12,6 +12,7 @@ import json
 import os
 import torch
 torch.set_float32_matmul_precision('medium')
+os.environ["TOKENIZERS_PARALLELISM"]='true'
 
 
 
@@ -19,14 +20,14 @@ parser = argparse.ArgumentParser()
 
 if __name__ == "__main__":
     #Paths
-    parser.add_argument('--saving_path', type=str, default='./ckpt')
+    parser.add_argument('--saving_path', type=str, default='./NEW_CKPT')
     parser.add_argument('--resume_checkpoint', type=str, default=None)
     parser.add_argument('--vocoder_config_path', type=str, required=True)
     parser.add_argument('--vocoder_ckpt_path', type=str, required=True)
     parser.add_argument('--datadir', type=str, required=True)
     parser.add_argument('--metapath', type=str, required=True)
     parser.add_argument('--val_metapath', type=str, required=True)
-    parser.add_argument('--sampledir', type=str, default='./logs')
+    parser.add_argument('--sampledir', type=str, default='./newlogs_style_pyannote_semantic')
     parser.add_argument('--pretrained_path', type=str, default=None)
     parser.add_argument('--speaker_embedding_dir', type=str, default=None)
 
@@ -58,8 +59,8 @@ if __name__ == "__main__":
     parser.add_argument('--label_smoothing', type=float, default=0.0)
 
     #Trainer
-    parser.add_argument('--val_check_interval', type=float, default=1.0)
-    parser.add_argument('--check_val_every_n_epoch', type=int, default=1)
+    parser.add_argument('--val_check_interval', type=float, default=1000)
+    parser.add_argument('--check_val_every_n_epoch', type=int, default=30)
     parser.add_argument('--max_epochs', type=int, default=None)
     parser.add_argument('--precision', type=str, choices=['16-mixed', '32-true', "bf16-mixed"], default='32-true')
     parser.add_argument('--nworkers', type=int, default=16)
@@ -96,11 +97,11 @@ if __name__ == "__main__":
     parser.add_argument('--verbose_file', type=str, default='verbose.txt')
     
     #Additional Loss Functions for Quality Optimization
-    parser.add_argument('--speaker_similarity_weight', type=float, default=10.0, 
+    parser.add_argument('--speaker_similarity_weight', type=float, default=1.0, 
                         help='Weight for speaker embedding cosine similarity loss (0.0 = disabled)')
-    parser.add_argument('--utmos_weight', type=float, default=10.0,
+    parser.add_argument('--utmos_weight', type=float, default=0.0,
                         help='Weight for UTMOS MOS score loss (0.0 = disabled)')
-    parser.add_argument('--utmos_ckpt_path', default='deps/UTMOS22/fairseq_checkpoints/wav2vec_small.pt', type=str,
+    parser.add_argument('--utmos_ckpt_path', default='wav2vec_small.pt', type=str,
                         help='Path to pretrained UTMOS checkpoint for MOS prediction')
     parser.add_argument('--target_mos', type=float, default=5.0,
                         help='Target MOS score to optimize towards (default: 5.0)')
@@ -115,18 +116,18 @@ if __name__ == "__main__":
     # Setup strategy for distributed training
     strategy = None
     if args.distributed:
-        strategy = DDPStrategy(find_unused_parameters=True)
+        strategy = DDPStrategy(find_unused_parameters=False)
 
     checkpoint_callback = ModelCheckpoint(
         dirpath=args.saving_path,
         filename=(fname_prefix+'{epoch}-{step}'),
-        every_n_train_steps=(None if args.val_check_interval == 1.0 else (int(args.val_check_interval) if args.val_check_interval > 1.0 else None)),
-        every_n_epochs=(None if args.check_val_every_n_epoch == 1 else args.check_val_every_n_epoch),
+        every_n_epochs=2,
         verbose=True,
-        save_last=True
+        save_last=True,
+        save_on_train_epoch_end=True,
     )
 
-    logger = TensorBoardLogger(args.sampledir, name="JS-MQ-TTS-Semantic", version=args.version)
+    logger = TensorBoardLogger(args.sampledir, name="JS-MQ-TTS-Semantic-nLoss", version=args.version)
 
     val_interval = args.val_check_interval
     if val_interval > 1.0:
@@ -144,7 +145,8 @@ if __name__ == "__main__":
         use_distributed_sampler=False,
         accumulate_grad_batches=args.accumulate_grad_batches,
         logger=logger,
-        check_val_every_n_epoch=args.check_val_every_n_epoch
+        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        # strategy=strategy
     )
     model = Wav2TTS(args)
     wrapper.fit(model, ckpt_path=args.resume_checkpoint)
