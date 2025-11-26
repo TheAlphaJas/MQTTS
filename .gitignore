@@ -132,3 +132,4 @@ ckpt/
 quantizer/checkpoints/
 ckpt_test/
 epoch_2nd_00020.pth
+NEW_CKPT/
