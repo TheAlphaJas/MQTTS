@@ -68,9 +68,9 @@ def main():
     print('Initializing Inference Process..')
 
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_json', default='../datasets/train.json')
-    parser.add_argument('--input_wav_dir', default='../datasets/audios')
-    parser.add_argument('--output_json', default='../datasets/train_q.json')
+    parser.add_argument('--input_json', default='../../../imp_back/Testout/test.json')
+    parser.add_argument('--input_wav_dir', default='../../../imp_back/Testout/audios')
+    parser.add_argument('--output_json', default='../../../imp_back/Testout/test_q.json')
     parser.add_argument('--checkpoint_file', required=True)
     a = parser.parse_args()
 

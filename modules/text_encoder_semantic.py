@@ -9,7 +9,8 @@ class SemanticEncoder(nn.Module):
         print(f"Loading Semantic Encoder: {model_name}")
         self.model = AutoModel.from_pretrained(model_name)
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
-        self.device = device
+        self.device = torch.device(device)
+        self.model.to(self.device)
         
         if freeze:
             for param in self.model.parameters():
@@ -31,9 +32,11 @@ class SemanticEncoder(nn.Module):
         """
         # Tokenize
         encoded_input = self.tokenizer(text_list, padding=True, truncation=True, max_length=512, return_tensors='pt')
-        encoded_input = {k: v.to(self.model.device) for k, v in encoded_input.items()}
+        encoded_input = {k: v.to(self.device) for k, v in encoded_input.items()}
 
-        with torch.set_grad_enabled(not self.model.training): # Respect freeze status
+        requires_grad = any(param.requires_grad for param in self.model.parameters())
+        grad_context = torch.enable_grad() if requires_grad else torch.no_grad()
+        with grad_context:
             model_output = self.model(**encoded_input)
         
         # Perform pooling

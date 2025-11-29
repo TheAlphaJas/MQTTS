@@ -35,7 +35,7 @@ if __name__ == "__main__":
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--batch_size', type=float, default=150)
     parser.add_argument('--train_bucket_size', type=int, default=8192)
-    parser.add_argument('--training_step', type=int, default=16000000)
+    parser.add_argument('--training_step', type=int, default=26000000000)
     parser.add_argument('--optim_flat_percent', type=float, default=0.0)
     parser.add_argument('--warmup_step', type=int, default=50)
     parser.add_argument('--adam_beta1', type=float, default=0.9)
@@ -97,7 +97,7 @@ if __name__ == "__main__":
     parser.add_argument('--verbose_file', type=str, default='verbose.txt')
     
     #Additional Loss Functions for Quality Optimization
-    parser.add_argument('--speaker_similarity_weight', type=float, default=1.0, 
+    parser.add_argument('--speaker_similarity_weight', type=float, default=0.0, 
                         help='Weight for speaker embedding cosine similarity loss (0.0 = disabled)')
     parser.add_argument('--utmos_weight', type=float, default=0.0,
                         help='Weight for UTMOS MOS score loss (0.0 = disabled)')

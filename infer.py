@@ -10,6 +10,10 @@ from pathlib import Path
 import json
 import numpy as np
 from collections import Counter
+import torch
+import dp
+torch.serialization.add_safe_globals([dp.preprocessing.text.Preprocessor, dp.preprocessing.text.LanguageTokenizer, dp.preprocessing.text.SequenceTokenizer])
+
 
 parser = argparse.ArgumentParser()
 
@@ -20,6 +24,8 @@ parser.add_argument('--model_path', type=str, required=True)
 parser.add_argument('--input_path', type=str, required=True)
 parser.add_argument('--config_path', type=str, required=True)
 parser.add_argument('--spkr_embedding_path', type=str, default=None)
+parser.add_argument('--vocoder_config_path', type=str, required=True)
+parser.add_argument('--vocoder_ckpt_path', type=str, required=True)
 
 #Data
 parser.add_argument('--sample_rate', type=int, default=16000)
@@ -49,11 +55,36 @@ args.phoneset = ['<pad>', 'AA', 'AE', 'AH', 'AO', 'AW', 'AY', 'B', 'CH', 'D', 'D
 with open(args.config_path, 'r') as f:
     argdict = json.load(f)
     assert argdict['sample_rate'] == args.sample_rate, f"Sampling rate not consistent, stated {args.sample_rate}, but the model is trained on {argdict['sample_rate']}"
-    argdict.update(args.__dict__)
-    args.__dict__ = argdict
+    # Store command-line args before they get overwritten
+    cmdline_args = args.__dict__.copy()
+    # Update with config
+    args.__dict__.update(argdict)
+    # Override with command-line args (excluding None values from defaults)
+    for key, value in cmdline_args.items():
+        if key in ['config_path', 'model_path', 'input_path', 'outputdir', 'phonemizer_dict_path', 
+                   'vocoder_config_path', 'vocoder_ckpt_path', 'spkr_embedding_path', 'batch_size']:
+            # These are explicitly set by user, always use them
+            args.__dict__[key] = value
 
 if __name__ == '__main__':
     Path(args.outputdir).mkdir(parents=True, exist_ok=True)
+    
+    # Debug: Print critical paths
+    print(f"[INFO] Model path: {args.model_path}")
+    print(f"[INFO] Vocoder config: {args.vocoder_config_path}")
+    print(f"[INFO] Vocoder checkpoint: {args.vocoder_ckpt_path}")
+    print(f"[INFO] Style encoder type: {getattr(args, 'style_encoder_type', None)}")
+    
+    # Warning: Cannot use pre-computed embeddings with style encoder
+    if args.spkr_embedding_path and getattr(args, 'style_encoder_type', None) == 'style_tts2':
+        print("\n" + "="*80)
+        print("[WARNING] You are using --spkr_embedding_path with a style_tts2 model!")
+        print("[WARNING] Pre-computed embeddings only contain Pyannote embeddings.")
+        print("[WARNING] The model needs BOTH Pyannote AND StyleTTS2 embeddings (from raw audio).")
+        print("[WARNING] Please remove --spkr_embedding_path to process raw audio files instead.")
+        print("="*80 + "\n")
+        raise ValueError("Cannot use pre-computed speaker embeddings with style encoder model")
+    
     meter = pyln.Meter(args.sample_rate)
     phonemizer = Phonemizer.from_checkpoint(args.phonemizer_dict_path)
     with open(args.input_path, 'r') as f:

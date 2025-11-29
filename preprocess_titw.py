@@ -86,7 +86,7 @@ def process_json_file(json_path, audio_base_dir, output_audio_dir, phonemizer, m
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Preprocess TITW-easy dataset for MQTTS training.")
     parser.add_argument('--train_json', type=str, required=True, help="Path to the training JSON file (e.g., training.json).")
-    parser.add_argument('--val_json', type=str, required=True, help="Path to the validation JSON file (e.g., validation.json).")
+    # parser.add_argument('--val_json', type=str, required=True, help="Path to the validation JSON file (e.g., validation.json).")
     parser.add_argument('--outputdir', type=str, required=True, help="Directory to save the processed files (e.g., 'datasets').")
     parser.add_argument('--audio_base_dir', type=str, default='.', help="Base directory where the audio files are located.")
     args = parser.parse_args()

@@ -72,10 +72,10 @@ def preprocess(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input_wavs_dir', default='../../imp_back/datasets/audios')
-    parser.add_argument('--input_training_file', default='../../imp_back/datasets/training.txt')
-    parser.add_argument('--input_validation_file', default='../../imp_back/datasets/validation.txt')
-    parser.add_argument('--output_dir', default='../../imp_back/datasets/speaker_embeddings')
+    parser.add_argument('--input_wavs_dir', default='../../imp_back/Testout/audios')
+    parser.add_argument('--input_training_file', default='../../imp_back/Testout/testing.txt')
+    parser.add_argument('--input_validation_file', type=str)
+    parser.add_argument('--output_dir', default='../../imp_back/Testout/speaker_embeddings')
     parser.add_argument('--overwrite', action='store_true')
     
     args = parser.parse_args()

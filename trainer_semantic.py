@@ -233,12 +233,12 @@ class Wav2TTS(pl.LightningModule):
         # Loss weights (sensible defaults for wild-data TTS)
         # You can override these via hp.*_weight
         self.loss_weights = {
-            'ce': getattr(hp, 'ce_weight', 0.7),
-            'spk_sim': getattr(hp, 'speaker_similarity_weight', 1.0),
-            'mel_l1': getattr(hp, 'mel_l1_weight', 0.8),
+            'ce': getattr(hp, 'ce_weight', 1.0),
+            'spk_sim': getattr(hp, 'speaker_similarity_weight', 0.7),
+            'mel_l1': getattr(hp, 'mel_l1_weight', 0.0),
             'mel_l2': getattr(hp, 'mel_l2_weight', 0.0),
-            'stft': getattr(hp, 'stft_weight', 0.8),
-            'sisdr': getattr(hp, 'sisdr_weight', 0.5),
+            'stft': getattr(hp, 'stft_weight', 0.0),
+            'sisdr': getattr(hp, 'sisdr_weight', 0.0),
         }
         
         # Gumbel-Softmax temperature for differentiable sampling
@@ -485,7 +485,7 @@ class Wav2TTS(pl.LightningModule):
             # Clamp to valid range
             voc_input = torch.clamp(voc_input, 0, self.hp.n_codes - 1)
         else:
-            print("NON DIFF ERROR!!")
+            # print("NON DIFF ERROR!!")
             # Standard argmax (non-differentiable)
             with torch.no_grad():
                 voc_input = logits.argmax(dim=-1)
@@ -500,7 +500,7 @@ class Wav2TTS(pl.LightningModule):
         if self.use_gumbel and self.use_speaker_similarity_loss:
             audio_hat = self.vocoder(voc_input, voc_spkr)
         else:
-            print("GUMBEL NOT USED BRUH")
+            # print("GUMBEL NOT USED BRUH")
             with torch.no_grad():
                 audio_hat = self.vocoder(voc_input, voc_spkr)
         

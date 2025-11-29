@@ -20,27 +20,46 @@ class Wav2TTS_infer(nn.Module):
         self.hp = hp
         self.hp.init = 'std'
         self.TTSdecoder = TTSDecoder(hp, len(self.hp.phoneset))
-        self.spkr_linear = nn.Linear(512, hp.hidden_size)
-        self.phone_embedding = nn.Embedding(len(self.hp.phoneset), hp.hidden_size, padding_idx=self.hp.phoneset.index('<pad>'))
         
-        # Style Encoder support (optional, matching trainer logic)
-        self.style_encoder = None
-        if hasattr(hp, 'style_encoder_type') and hp.style_encoder_type == 'style_tts2':
-             self.style_encoder = StyleEncoder()
-             # If style encoder is used, spkr_linear needs to match training config (e.g. 640 -> hidden)
-             # But here we initialized it as 512 -> hidden above.
-             # If you are running inference on a model trained WITH style encoder, you must match it.
-             # Assuming the checkpoint loading will handle weight mismatch errors or we should adjust here.
-             # Let's adjust to be safe if config says so.
-             self.spkr_linear = nn.Linear(128 + 512, hp.hidden_size)
-
-        # Adapter for Vocoder
-        self.style_to_vocoder = None
-        if self.style_encoder:
+        # First, check the checkpoint to see if style encoder was used during training
+        checkpoint = torch.load(self.hp.model_path, map_location='cpu')
+        state_dict = checkpoint['state_dict']
+        
+        # CRITICAL: Check if checkpoint was trained with semantic encoder
+        has_semantic = any('semantic' in k.lower() for k in state_dict.keys())
+        if has_semantic:
+            print("\n" + "="*80)
+            print("[ERROR] This checkpoint was trained with SEMANTIC encoder!")
+            print("[ERROR] You are using vanilla tester.py (no semantic support).")
+            print("[ERROR] Please use tester_semantic.py and infer_semantic.py instead!")
+            print("="*80 + "\n")
+            raise ValueError("Checkpoint/Tester mismatch: Use tester_semantic.py for semantic checkpoints")
+        
+        has_style_encoder = any('style_encoder' in k for k in state_dict.keys())
+        has_style_to_vocoder = any('style_to_vocoder' in k for k in state_dict.keys())
+        
+        # Determine speaker embedding dimension based on checkpoint
+        if has_style_encoder or has_style_to_vocoder:
+            print("[INFO] Checkpoint was trained WITH style encoder. Initializing style encoder...")
+            spkr_embed_dim = 128 + 512  # StyleTTS2 (128) + Pyannote (512)
+            self.style_encoder = StyleEncoder()
             self.style_to_vocoder = nn.Linear(128 + 512, 512)
+        else:
+            print("[INFO] Checkpoint was trained WITHOUT style encoder. Using Pyannote only...")
+            spkr_embed_dim = 512
+            self.style_encoder = None
+            self.style_to_vocoder = None
 
+        self.spkr_linear = nn.Linear(spkr_embed_dim, hp.hidden_size)
+        self.phone_embedding = nn.Embedding(len(self.hp.phoneset), hp.hidden_size, padding_idx=self.hp.phoneset.index('<pad>'))
+
+        # Load checkpoint weights
         self.load()
+        
+        # Initialize Pyannote speaker embedding model
         self.spkr_embedding = Inference("pyannote/embedding", window="whole")
+        
+        # Initialize vocoder from checkpoint (not random weights)
         self.vocoder = Vocoder(hp.vocoder_config_path, hp.vocoder_ckpt_path, with_encoder=True)
         
     def load(self):
@@ -65,6 +84,14 @@ class Wav2TTS_infer(nn.Module):
             for wav in wavs:
                 if self.hp.spkr_embedding_path:
                     speaker_embeddings.append(np.load(wav))
+                    # If style encoder is used, we still need to load/extract style embedding from audio
+                    if self.style_encoder:
+                        # Need to load the actual audio for style encoder
+                        # The spkr_embedding_path only contains Pyannote embeddings
+                        # This is a limitation - we need the original audio file path
+                        # For now, raise an error to indicate this limitation
+                        raise ValueError("Cannot use pre-computed speaker embeddings with style encoder. "
+                                       "Please provide audio files directly (remove --spkr_embedding_path)")
                 else:
                     # If wav is a path string
                     if isinstance(wav, str):
@@ -78,12 +105,12 @@ class Wav2TTS_infer(nn.Module):
                     spk_emb = self.spkr_embedding({'waveform': wav_torch, 'sample_rate': self.hp.sample_rate})
                     speaker_embeddings.append(spk_emb)
                     
-                    # Style Encoder
+                    # Style Encoder (always extract if model was trained with it)
                     if self.style_encoder:
                         style_emb = self.style_encoder(wav_torch.cuda())
                         style_embeddings.append(style_emb)
 
-            speaker_embeddings = torch.cuda.FloatTensor(np.array(speaker_embeddings))
+            speaker_embeddings = torch.tensor(np.array(speaker_embeddings), dtype=torch.float32, device='cuda')
             norm_spkr = F.normalize(speaker_embeddings, dim=-1)
             
             if self.style_encoder and len(style_embeddings) > 0:

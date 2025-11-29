@@ -74,14 +74,14 @@ if __name__ == "__main__":
     parser.add_argument('--repetition_penalty', type=float, default=1.0)
     parser.add_argument('--sampling_temperature', type=float, default=1.0)
     parser.add_argument('--top_k', type=int, default=-1)
-    parser.add_argument('--min_top_k', type=int, default=3)
+    parser.add_argument('--min_top_k', type=int, default=5)
     parser.add_argument('--top_p', type=float, default=0.7)
     parser.add_argument('--sample_num', type=int, default=4)
     parser.add_argument('--length_penalty_max_length', type=int, default=15000)
     parser.add_argument('--length_penalty_max_prob', type=float, default=0.95)
     parser.add_argument('--max_input_length', type=int, default=2048)
     parser.add_argument('--max_output_length', type=int, default=1500)
-    parser.add_argument('--phone_context_window', type=int, default=3)
+    parser.add_argument('--phone_context_window', type=int, default=7)
 
     #Data
     parser.add_argument('--sample_rate', type=int, default=16000)
@@ -92,7 +92,7 @@ if __name__ == "__main__":
     parser.add_argument('--style_encoder_type', type=str, choices=['style_tts2'], default=None)
     parser.add_argument('--style_encoder_ckpt', type=str, default=None)
     parser.add_argument('--fine_tune_vocoder', action='store_true')
-    parser.add_argument('--speaker_embedding_dir', type=str, default=None)
+    # parser.add_argument('--speaker_embedding_dir', type=str, default=None)
     parser.add_argument('--verbose_step', type=int, default=1000)
     parser.add_argument('--verbose_file', type=str, default='verbose.txt')
 

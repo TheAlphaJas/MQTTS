@@ -1,5 +1,3 @@
-import warnings
-warnings.filterwarnings("ignore", message="torchaudio._backend.set_audio_backend has been deprecated")
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks import ModelCheckpoint
 from tester_semantic import Wav2TTS_infer
@@ -10,10 +8,13 @@ import pyloudnorm as pyln
 import os
 from pathlib import Path
 import json
+import dp
 import numpy as np
 from collections import Counter
 
 parser = argparse.ArgumentParser()
+import torch
+torch.serialization.add_safe_globals([dp.preprocessing.text.Preprocessor, dp.preprocessing.text.LanguageTokenizer, dp.preprocessing.text.SequenceTokenizer])
 
 #Path
 parser.add_argument('--phonemizer_dict_path', type=str, required=True)
@@ -22,6 +23,8 @@ parser.add_argument('--model_path', type=str, required=True)
 parser.add_argument('--input_path', type=str, required=True)
 parser.add_argument('--config_path', type=str, required=True)
 parser.add_argument('--spkr_embedding_path', type=str, default=None)
+parser.add_argument('--vocoder_config_path', type=str, required=True)
+parser.add_argument('--vocoder_ckpt_path', type=str, required=True)
 
 #Data
 parser.add_argument('--sample_rate', type=int, default=16000)
@@ -51,11 +54,36 @@ args.phoneset = ['<pad>', 'AA', 'AE', 'AH', 'AO', 'AW', 'AY', 'B', 'CH', 'D', 'D
 with open(args.config_path, 'r') as f:
     argdict = json.load(f)
     assert argdict['sample_rate'] == args.sample_rate, f"Sampling rate not consistent, stated {args.sample_rate}, but the model is trained on {argdict['sample_rate']}"
-    argdict.update(args.__dict__)
-    args.__dict__ = argdict
+    # Store command-line args before they get overwritten
+    cmdline_args = args.__dict__.copy()
+    # Update with config
+    args.__dict__.update(argdict)
+    # Override with command-line args (excluding None values from defaults)
+    for key, value in cmdline_args.items():
+        if key in ['config_path', 'model_path', 'input_path', 'outputdir', 'phonemizer_dict_path', 
+                   'vocoder_config_path', 'vocoder_ckpt_path', 'spkr_embedding_path', 'batch_size']:
+            # These are explicitly set by user, always use them
+            args.__dict__[key] = value
 
 if __name__ == '__main__':
     Path(args.outputdir).mkdir(parents=True, exist_ok=True)
+    
+    # Debug: Print critical paths
+    print(f"[INFO] Model path: {args.model_path}")
+    print(f"[INFO] Vocoder config: {args.vocoder_config_path}")
+    print(f"[INFO] Vocoder checkpoint: {args.vocoder_ckpt_path}")
+    print(f"[INFO] Style encoder type: {getattr(args, 'style_encoder_type', None)}")
+    
+    # Warning: Cannot use pre-computed embeddings with style encoder
+    if args.spkr_embedding_path and getattr(args, 'style_encoder_type', None) == 'style_tts2':
+        print("\n" + "="*80)
+        print("[WARNING] You are using --spkr_embedding_path with a style_tts2 model!")
+        print("[WARNING] Pre-computed embeddings only contain Pyannote embeddings.")
+        print("[WARNING] The model needs BOTH Pyannote AND StyleTTS2 embeddings (from raw audio).")
+        print("[WARNING] Please remove --spkr_embedding_path to process raw audio files instead.")
+        print("="*80 + "\n")
+        raise ValueError("Cannot use pre-computed speaker embeddings with style encoder model")
+    
     meter = pyln.Meter(args.sample_rate)
     phonemizer = Phonemizer.from_checkpoint(args.phonemizer_dict_path)
     with open(args.input_path, 'r') as f:
@@ -65,7 +93,7 @@ if __name__ == '__main__':
     model.vocoder.generator.remove_weight_norm()
     model.vocoder.encoder.remove_weight_norm()
     model.eval()
-    i_wavs, i_phones, written = [], [], 0
+    i_wavs, i_phones, i_texts, written = [], [], [], 0
     for i, (speaker_path, sentence) in enumerate(input_file):
         if args.spkr_embedding_path:
             i_wavs.append(os.path.join(args.spkr_embedding_path, os.path.basename(speaker_path)[:-4] + '.npy'))
@@ -78,19 +106,18 @@ if __name__ == '__main__':
         phones = phonemizer(sentence.strip().lower(), lang='en_us').replace('[', ' ').replace(']', ' ').split()
         phones = [''.join(i for i in phone if not i.isdigit()) for phone in phones if phone.strip()]
         i_phones.append(phones)
+        # Store raw text for semantic embedding extraction
+        i_texts.append(sentence.strip())
         if len(i_wavs) == args.batch_size:
-            print (f"Inferencing batch {written//args.batch_size+1}, total {len(input_file)//args.batch_size+1} baches.")
-            # Pass sentences (text) to model as well
-            sentences_batch = [item[1] for item in input_file[written:written+args.batch_size]]
-            synthetic = model(i_wavs, i_phones, sentences_batch)
+            print (f"Inferencing batch {written//args.batch_size+1}, total {len(input_file)//args.batch_size+1} batches.")
+            synthetic = model(i_wavs, i_phones, i_texts)
             for s in synthetic:
                 sf.write(os.path.join(args.outputdir, f'sentence-{written+1}-1.wav'), s, args.sample_rate)
                 written += 1
-            i_wavs, i_phones = [], []
+            i_wavs, i_phones, i_texts = [], [], []
     if len(i_wavs) > 0:
-        # Remaining batch
-        sentences_batch = [item[1] for item in input_file[written:]]
-        synthetic = model(i_wavs, i_phones, sentences_batch)
+        synthetic = model(i_wavs, i_phones, i_texts)
         for s in synthetic:
             sf.write(os.path.join(args.outputdir, f'sentence-{written+1}-1.wav'), s, args.sample_rate)
             written += 1
+
